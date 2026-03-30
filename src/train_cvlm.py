@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable bf16 (use float32 on CUDA).",
     )
+    p.add_argument(
+        "--tensorboard_dir",
+        type=str,
+        default="",
+        help="Directory for TensorBoard logs. Defaults to <output_dir>/tb if not set.",
+    )
     return p.parse_args()
 
 
@@ -243,6 +249,13 @@ def main() -> None:
             f"  grad_clip: {grad_clip}\n"
         )
 
+    writer = None
+    if is_master:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_dir = args.tensorboard_dir.strip() or os.path.join(args.output_dir, "tb")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+
     model.train()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
@@ -337,6 +350,13 @@ def main() -> None:
                     gn,
                     f"data: {data_time:>7.5f}s batch: {batch_time:>6.3f}s",
                 )
+                if writer is not None:
+                    writer.add_scalar("train/loss", curr_loss, global_step)
+                    writer.add_scalar("train/loss_avg", running_avg_loss_value.avg, global_step)
+                    writer.add_scalar("train/lr", curr_lrs[0] if curr_lrs else args.lr, global_step)
+                    if grad_norm > 0:
+                        writer.add_scalar("train/grad_norm", grad_norm, global_step)
+                    writer.add_scalar("train/batch_time", batch_time, global_step)
 
             if (
                 is_master
@@ -387,6 +407,9 @@ def main() -> None:
 
     if is_master:
         print("Training finished.")
+
+    if writer is not None:
+        writer.close()
 
     cleanup_distributed(use_ddp)
 
