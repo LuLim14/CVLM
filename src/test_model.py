@@ -13,7 +13,7 @@ def test_train_forward(model, input_embeds, prompt_ids, answer_ids):
 if __name__ == "__main__":
     model_args = ModelArguments()
     training_args = TrainingArguments()
-    model = CVLM(model_args, training_args, None)
+    model = CVLM(model_args, training_args)
     model.eval()
     model.to("cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, use_fast=False)

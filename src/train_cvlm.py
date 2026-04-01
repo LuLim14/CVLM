@@ -143,7 +143,7 @@ def main() -> None:
     training_args.bf16 = bool(use_bf16)
     training_args.restore_from = args.restore_from or ""
 
-    model = CVLM(model_args, training_args, None)
+    model = CVLM(model_args, training_args)
     model.to(device)
 
     tok_pad = model.tokenizer.pad_token_id
@@ -257,6 +257,8 @@ def main() -> None:
         writer = SummaryWriter(log_dir=tb_dir)
 
     model.train()
+    # Frozen decoder must stay in eval mode (no dropout noise on frozen weights).
+    unwrap_model(model).decoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
 
