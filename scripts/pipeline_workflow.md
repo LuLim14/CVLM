@@ -27,8 +27,11 @@ tail -f $HOME/cvlm_runs/run1/pipeline.log   # or just follow the log from any sh
 The pipeline logs both train and eval under $OUTPUT_DIR/tb:
 
 `…/tb/train/…` ← training scalars (loss, lr, grad_norm, batch_time)
+
 `…/tb/eval_cvlm/…` ← eval_cvlm scalars + compression_ratio histogram
+
 `…/tb/eval_baseline_llm/…` ← baseline for comparison
+
 Start TB in a second tmux window (or any shell):
 
 ```
