@@ -1,4 +1,4 @@
-3. tmux workflow (survives terminal disconnect)
+### tmux workflow (survives terminal disconnect)
 Do you need tmux? Strictly speaking, no — nohup ... & also works — but tmux is what you actually want because:
 
 You can reattach and watch live logs interactively.
