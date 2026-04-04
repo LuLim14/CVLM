@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 # --- defaults (override with env or edit below) ---
-EMBEDDINGS_PATH="${EMBEDDINGS_PATH:-${ROOT}/data/processed/embeddings.npy}"
+EMBEDDINGS_PATH="${EMBEDDINGS_PATH:-${ROOT}/data/processed/embeddings.npz}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT}/runs/cvlm_$(date +%Y%m%d_%H%M%S)}"
 DATASET_NAME="${DATASET_NAME:-sggetao/PwC}"
 EMBEDDER_MODEL="${EMBEDDER_MODEL:-answerdotai/ModernBERT-base}"

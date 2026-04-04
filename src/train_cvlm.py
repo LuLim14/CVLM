@@ -118,6 +118,9 @@ def set_seed(seed: int, rank: int) -> None:
 def move_batch(batch: dict, device: torch.device, dtype: torch.dtype) -> dict:
     out = {}
     for k, v in batch.items():
+        if not torch.is_tensor(v):
+            out[k] = v
+            continue
         if k == "input_embeds":
             out[k] = v.to(device=device, dtype=dtype)
         else:
@@ -138,6 +141,7 @@ def main() -> None:
         model_args.model_name_or_path = args.model_name_or_path
     if args.vision_encoder_name:
         model_args.vision_encoder_name = args.vision_encoder_name
+    model_args.max_vision_len = args.max_vision_len
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
@@ -284,31 +288,25 @@ def main() -> None:
             batch_cpu = batch_data
             batch_data = move_batch(batch_cpu, device, dtype)
 
-            if (
-                local_step == 1
-                or local_step % grad_accum_steps == 0
-            ):
-                curr_lrs = []
-                lr_scheduler.step()
-
-                if global_step > warmup_steps:
-                    for param_group in optimizer.param_groups:
-                        curr_lrs.append(param_group["lr"])
-                else:
-                    if warmup_steps > 0:
-                        for group_id, param_group in enumerate(optimizer.param_groups):
-                            curr_lr = init_lrs[group_id] * global_step / warmup_steps
-                            param_group["lr"] = curr_lr
-                            curr_lrs.append(curr_lr)
-                    else:
-                        for param_group in optimizer.param_groups:
-                            curr_lrs.append(param_group["lr"])
+            # LR schedule: warmup (if any) uses linear on global_step, else read
+            # current group LR. The scheduler itself is stepped *after*
+            # optimizer.step() so the first update sees the initial LR.
+            curr_lrs = []
+            if global_step <= warmup_steps and warmup_steps > 0:
+                for group_id, param_group in enumerate(optimizer.param_groups):
+                    curr_lr = init_lrs[group_id] * global_step / warmup_steps
+                    param_group["lr"] = curr_lr
+                    curr_lrs.append(curr_lr)
+            else:
+                for param_group in optimizer.param_groups:
+                    curr_lrs.append(param_group["lr"])
 
             out = model(
                 batch_data["input_embeds"],
                 batch_data["prompt_ids"],
                 batch_data["answer_ids"],
                 answer_labels=batch_data["answer_labels"],
+                attention_mask=batch_data["attention_mask"],
             )
             loss = out["loss"]
             loss = loss / grad_accum_steps
@@ -331,10 +329,9 @@ def main() -> None:
                     )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                if global_step > warmup_steps:
+                    lr_scheduler.step()
                 global_step += 1
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
             t1 = time.perf_counter()
             batch_time = t1 - t0
