@@ -48,6 +48,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--compute_generation_metrics", action="store_true", help="Compute ROUGE/BLEU (slow, requires generation).")
     p.add_argument("--output_json", type=str, default="", help="Save results to JSON file.")
+    p.add_argument("--tensorboard_dir", type=str, default="",
+                   help="If set, log eval metrics (scalars + compression-ratio histogram) to this TB dir. "
+                        "Point it at the same <output_dir>/tb used by training to see train+eval together.")
+    p.add_argument("--tb_run_name", type=str, default="",
+                   help="Sub-run name under tensorboard_dir. Defaults to 'eval_<mode>'.")
+    p.add_argument("--global_step", type=int, default=0,
+                   help="Step to tag eval scalars with in TB (e.g. the checkpoint's training step).")
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -634,6 +641,37 @@ def main() -> None:
         "bits_per_source_token": bps,
         "effective_context_reduction": eff_reduction,
     }
+
+    # TensorBoard logging (point at the same dir training used to get one view)
+    if args.tensorboard_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        run_name = args.tb_run_name or f"eval_{args.mode}"
+        tb_path = os.path.join(args.tensorboard_dir, run_name)
+        os.makedirs(tb_path, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_path)
+        step = int(args.global_step)
+        # Scalar metrics (everything numeric in results except the mode string).
+        for k, v in results.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                writer.add_scalar(f"eval/{k}", float(v), step)
+        # Histogram of the per-sample compression ratios (re-tokenise once — cheap
+        # compared to generation — to get the raw distribution back).
+        per_sample_ratios = []
+        limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
+        for idx in range(limit):
+            src_i = dataset._row_indices[idx]
+            emb = dataset._get_row(src_i)
+            v_len = max(int(emb.shape[0] if emb.ndim == 2 else 1), 1)
+            row_id = int(dataset._indexes[src_i])
+            s_len = len(model.tokenizer(
+                dataset._hf[row_id]["input"], add_special_tokens=False, truncation=False
+            )["input_ids"])
+            per_sample_ratios.append(s_len / v_len)
+        if per_sample_ratios:
+            writer.add_histogram("eval/compression_ratio_dist", np.asarray(per_sample_ratios), step)
+        writer.close()
+        print(f"\nEval metrics logged to TensorBoard at {tb_path} (step={step})")
+
     if args.output_json:
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         with open(args.output_json, "w") as f:
