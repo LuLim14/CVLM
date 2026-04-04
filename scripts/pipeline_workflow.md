@@ -26,9 +26,9 @@ tail -f $HOME/cvlm_runs/run1/pipeline.log   # or just follow the log from any sh
 # Watch TensorBoard while it runs
 The pipeline logs both train and eval under $OUTPUT_DIR/tb:
 
-…/tb/train/… ← training scalars (loss, lr, grad_norm, batch_time)
-…/tb/eval_cvlm/… ← eval_cvlm scalars + compression_ratio histogram
-…/tb/eval_baseline_llm/… ← baseline for comparison
+`…/tb/train/…` ← training scalars (loss, lr, grad_norm, batch_time)
+`…/tb/eval_cvlm/…` ← eval_cvlm scalars + compression_ratio histogram
+`…/tb/eval_baseline_llm/…` ← baseline for comparison
 Start TB in a second tmux window (or any shell):
 
 ```
@@ -36,7 +36,7 @@ tmux new -s tb -d "conda activate cvlm && \
   tensorboard --logdir $HOME/cvlm_runs/run1/tb --port 6006 --bind_all"
 ```
 
-Then open http://<host>:6006 in your browser. You'll see training loss over steps and eval metrics plotted at the checkpoint's step index (that's what --global_step ${STEP} does — eval scalars are stamped with the training step they were computed from, so they line up on the same x-axis as train curves).
+Then open `http://<host>:6006` in your browser. You'll see training loss over steps and eval metrics plotted at the checkpoint's step index (that's what `--global_step ${STEP}` does — eval scalars are stamped with the training step they were computed from, so they line up on the same x-axis as train curves).
 
 # Minimal alternative without tmux
 If tmux isn't available for some reason:
