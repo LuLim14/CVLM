@@ -7,6 +7,12 @@ No special handling of stdout/stderr — the pipeline script already tees to pip
 One-liner you can copy-paste
 
 # Create a detached session and launch the pipeline inside it
+Last version
+```
+conda activate cvlm 
+tmux new -s cvlm -d "bash /home/jovyan/shares/SR008.fs2/acherepanov/compress_project_new/CVLM/scripts/run_full_pipeline.sh; exec bash"
+```
+
 ```
 tmux new -s cvlm -d "conda activate cvlm && \
   OUTPUT_DIR=$HOME/cvlm_runs/run1 \

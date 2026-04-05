@@ -29,23 +29,19 @@ from train_utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train CVLM")
+    p = argparse.ArgumentParser(description="Train CVLM (on-the-fly text-encoder variant).")
     p.add_argument("--output_dir", type=str, required=True)
-    p.add_argument(
-        "--embeddings_path",
-        type=str,
-        default=os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "data",
-            "dataset_100_samples",
-            "embeddings.npy",
-        ),
-    )
     p.add_argument("--dataset_name", type=str, default="sggetao/PwC")
     p.add_argument("--dataset_split", type=str, default="train")
-    p.add_argument("--model_name_or_path", type=str, default=None)
+    p.add_argument("--model_name_or_path", type=str, default=None,
+                   help="HF id for the frozen decoder (e.g. HuggingFaceTB/SmolLM-135M-Instruct).")
     p.add_argument("--vision_encoder_name", type=str, default=None)
+    p.add_argument("--text_encoder_name", type=str, default=None,
+                   help="HF id for the frozen text encoder (default: answerdotai/ModernBERT-base).")
+    p.add_argument("--compression_rate", type=int, default=4,
+                   help="Chunk size for mean-pool over encoder tokens into vision tokens.")
+    p.add_argument("--max_samples", type=int, default=0,
+                   help="Cap HF dataset to first N rows (0 = all).")
     p.add_argument(
         "--max_prompt_len",
         type=int,
@@ -62,7 +58,13 @@ def parse_args() -> argparse.Namespace:
         "--max_vision_len",
         type=int,
         default=512,
-        help="Keep only samples with vision seq length (embedding rows) <= this (no truncation).",
+        help="Max compressed-vision sequence length per sample; sizes the learned positional embedding.",
+    )
+    p.add_argument(
+        "--max_source_len",
+        type=int,
+        default=0,
+        help="Max source-encoder tokens per sample (0 = compression_rate * max_vision_len).",
     )
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=2)
@@ -116,15 +118,14 @@ def set_seed(seed: int, rank: int) -> None:
 
 
 def move_batch(batch: dict, device: torch.device, dtype: torch.dtype) -> dict:
+    # All tensors are now long ids / masks; no fp cast needed. dtype kept for API compat.
+    del dtype
     out = {}
     for k, v in batch.items():
-        if not torch.is_tensor(v):
-            out[k] = v
-            continue
-        if k == "input_embeds":
-            out[k] = v.to(device=device, dtype=dtype)
-        else:
+        if torch.is_tensor(v):
             out[k] = v.to(device=device)
+        else:
+            out[k] = v
     return out
 
 
@@ -141,7 +142,10 @@ def main() -> None:
         model_args.model_name_or_path = args.model_name_or_path
     if args.vision_encoder_name:
         model_args.vision_encoder_name = args.vision_encoder_name
+    if args.text_encoder_name:
+        model_args.text_encoder_name = args.text_encoder_name
     model_args.max_vision_len = args.max_vision_len
+    model_args.compression_rate = args.compression_rate
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
@@ -150,19 +154,22 @@ def main() -> None:
     model = CVLM(model_args, training_args)
     model.to(device)
 
-    tok_pad = model.tokenizer.pad_token_id
-    if tok_pad is None:
-        raise ValueError("Tokenizer must define pad_token for batching")
+    dec_pad = model.tokenizer.pad_token_id
+    enc_pad = model.encoder_tokenizer.pad_token_id
+    if dec_pad is None or enc_pad is None:
+        raise ValueError("Both decoder and encoder tokenizers must define pad_token for batching")
 
-    collate = make_collate_fn(tok_pad)
+    collate = make_collate_fn(dec_pad_id=dec_pad, enc_pad_id=enc_pad)
+    max_source_len = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
     dataset = CvlmTrainDataset(
-        embeddings_path=os.path.normpath(args.embeddings_path),
         hf_dataset_name=args.dataset_name,
         hf_split=args.dataset_split,
-        tokenizer_name=model_args.model_name_or_path,
+        decoder_tokenizer_name=model_args.model_name_or_path,
+        encoder_tokenizer_name=model_args.text_encoder_name,
         max_prompt_len=args.max_prompt_len,
         max_answer_len=args.max_answer_len,
-        max_vision_len=args.max_vision_len,
+        max_source_len=max_source_len,
+        max_samples=args.max_samples,
     )
 
     sampler: Optional[DistributedSampler] = None
@@ -261,8 +268,9 @@ def main() -> None:
         writer = SummaryWriter(log_dir=tb_dir)
 
     model.train()
-    # Frozen decoder must stay in eval mode (no dropout noise on frozen weights).
+    # Frozen sub-modules must stay in eval mode (no dropout noise on frozen weights).
     unwrap_model(model).decoder.eval()
+    unwrap_model(model).text_encoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
 
@@ -302,11 +310,13 @@ def main() -> None:
                     curr_lrs.append(param_group["lr"])
 
             out = model(
-                batch_data["input_embeds"],
-                batch_data["prompt_ids"],
-                batch_data["answer_ids"],
+                source_input_ids=batch_data["source_ids"],
+                source_attention_mask=batch_data["source_attention_mask"],
+                prompt_ids=batch_data["prompt_ids"],
+                answer_ids=batch_data["answer_ids"],
                 answer_labels=batch_data["answer_labels"],
-                attention_mask=batch_data["attention_mask"],
+                prompt_mask=batch_data["prompt_mask"],
+                answer_mask=batch_data["answer_mask"],
             )
             loss = out["loss"]
             loss = loss / grad_accum_steps

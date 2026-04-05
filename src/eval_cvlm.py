@@ -1,7 +1,9 @@
-# Evaluation script for CVLM with three modes:
-#   cvlm          – full pipeline (embeddings → ViT → projectors → decoder)
-#   baseline_llm  – bare SmolLM decoder (prompt tokens only, no embeddings)
-#   baseline_proj – embeddings projected directly to LLM space (skip ViT)
+# Evaluation script for CVLM (on-the-fly text-encoder variant).
+#
+# Modes:
+#   cvlm          – full pipeline (text_encoder → pool → ViT → projectors → decoder)
+#   baseline_llm  – bare decoder on prompt tokens only (no vision span)
+#   baseline_proj – text_encoder → chunked pool → random linear projection → decoder (skip ViT)
 
 from __future__ import annotations
 
@@ -9,59 +11,80 @@ import argparse
 import json
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
-from modeling import CVLM, ModelArguments, TrainingArguments
+from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_mean_pool
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate CVLM")
+    p = argparse.ArgumentParser(description="Evaluate CVLM (on-the-fly encoder variant)")
     p.add_argument("--checkpoint_path", type=str, default="", help="Path to model_step_*.safetensors")
-    p.add_argument(
-        "--embeddings_path",
-        type=str,
-        default=os.path.join(os.path.dirname(__file__), "..", "data", "dataset_100_samples", "embeddings.npy"),
-    )
     p.add_argument("--dataset_name", type=str, default="sggetao/PwC")
     p.add_argument("--dataset_split", type=str, default="test")
     p.add_argument("--model_name_or_path", type=str, default=None)
     p.add_argument("--vision_encoder_name", type=str, default=None)
+    p.add_argument("--text_encoder_name", type=str, default=None)
+    p.add_argument("--compression_rate", type=int, default=4)
     p.add_argument("--max_prompt_len", type=int, default=512)
     p.add_argument("--max_answer_len", type=int, default=2048)
     p.add_argument("--max_vision_len", type=int, default=512)
+    p.add_argument("--max_source_len", type=int, default=0,
+                   help="0 = compression_rate * max_vision_len")
     p.add_argument("--max_samples", type=int, default=0, help="Limit eval to first N samples (0 = all).")
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--max_new_tokens", type=int, default=256, help="Max tokens to generate for generation metrics.")
+    p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument(
         "--mode",
         type=str,
         default="cvlm",
         choices=["cvlm", "baseline_llm", "baseline_proj"],
-        help="cvlm: full pipeline; baseline_llm: prompt-only decoder; baseline_proj: linear proj (no ViT).",
     )
-    p.add_argument("--compute_generation_metrics", action="store_true", help="Compute ROUGE/BLEU (slow, requires generation).")
-    p.add_argument("--output_json", type=str, default="", help="Save results to JSON file.")
-    p.add_argument("--tensorboard_dir", type=str, default="",
-                   help="If set, log eval metrics (scalars + compression-ratio histogram) to this TB dir. "
-                        "Point it at the same <output_dir>/tb used by training to see train+eval together.")
-    p.add_argument("--tb_run_name", type=str, default="",
-                   help="Sub-run name under tensorboard_dir. Defaults to 'eval_<mode>'.")
-    p.add_argument("--global_step", type=int, default=0,
-                   help="Step to tag eval scalars with in TB (e.g. the checkpoint's training step).")
+    p.add_argument("--compute_generation_metrics", action="store_true")
+    p.add_argument("--output_json", type=str, default="")
+    p.add_argument("--tensorboard_dir", type=str, default="")
+    p.add_argument("--tb_run_name", type=str, default="")
+    p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Teacher-forcing metrics (fast, no generation)
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _move(batch: dict, device: torch.device) -> dict:
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device=device)
+        else:
+            out[k] = v
+    return out
+
+
+def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
+    """Run the frozen text_encoder + chunked mean pool. Used by baseline_proj."""
+    with torch.no_grad():
+        h = model.text_encoder(input_ids=source_ids, attention_mask=source_mask).last_hidden_state
+    pooled, vmask = _chunked_mean_pool(
+        h.detach(),
+        source_mask,
+        compression_rate=model.compression_rate,
+        max_vision_len=model.max_vision_len,
+    )
+    return pooled, vmask
+
+
+# ---------------------------------------------------------------------------
+# Teacher-forcing metrics
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -69,10 +92,8 @@ def eval_teacher_forcing_cvlm(
     model: CVLM,
     loader: DataLoader,
     device: torch.device,
-    dtype: torch.dtype,
     max_samples: int,
 ) -> Dict[str, float]:
-    """Full CVLM forward: embeddings → ViT → projectors → decoder."""
     model.eval()
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
     total_loss = 0.0
@@ -85,29 +106,30 @@ def eval_teacher_forcing_cvlm(
     total_p_real = 0
 
     for batch in tqdm(loader, desc="eval (cvlm)"):
-        batch = _move(batch, device, dtype)
+        batch = _move(batch, device)
         out = model(
-            batch["input_embeds"],
-            batch["prompt_ids"],
-            batch["answer_ids"],
+            source_input_ids=batch["source_ids"],
+            source_attention_mask=batch["source_attention_mask"],
+            prompt_ids=batch["prompt_ids"],
+            answer_ids=batch["answer_ids"],
             answer_labels=batch["answer_labels"],
-            attention_mask=batch["attention_mask"],
+            prompt_mask=batch["prompt_mask"],
+            answer_mask=batch["answer_mask"],
         )
         logits = out["logits"]
+        vision_mask = out["vision_mask"]
+        full_attn = out["attention_mask"]
         answer_labels = batch["answer_labels"]
-        attn = batch["attention_mask"]
         B = batch["prompt_ids"].size(0)
         P = batch["prompt_ids"].size(1)
-        V = batch["input_embeds"].size(1)
+        V = vision_mask.size(1)
 
-        # Real (non-pad) decoder lengths per sample from the attention mask.
-        real_lens = attn.sum(dim=1).tolist()
+        real_lens = full_attn.sum(dim=1).tolist()
         total_dec_len += sum(real_lens)
         max_dec_len = max(max_dec_len, max(real_lens))
-        total_v_real += int(batch["vision_lens"].sum().item())
-        total_p_real += int(attn[:, :P].sum().item())
+        total_v_real += int(vision_mask.sum().item())
+        total_p_real += int(batch["prompt_mask"].sum().item())
 
-        # Rebuild the full labels tensor to match the logits layout.
         ignore = torch.full((B, P + V), -100, dtype=answer_labels.dtype, device=device)
         labels_full = torch.cat([ignore, answer_labels], dim=1)
         shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
@@ -117,8 +139,7 @@ def eval_teacher_forcing_cvlm(
         total_loss += per_tok[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        # Token accuracy on answer positions.
-        answer_logits = logits[:, P + V - 1 : -1, :]  # [B, A, vocab]
+        answer_logits = logits[:, P + V - 1:-1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -146,10 +167,9 @@ def eval_teacher_forcing_baseline_llm(
     model: CVLM,
     loader: DataLoader,
     device: torch.device,
-    dtype: torch.dtype,
     max_samples: int,
 ) -> Dict[str, float]:
-    """Baseline: feed prompt tokens directly into decoder, no embeddings."""
+    """Baseline: prompt tokens + answer tokens into the frozen decoder, no vision span."""
     model.eval()
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
     total_loss = 0.0
@@ -160,18 +180,17 @@ def eval_teacher_forcing_baseline_llm(
     max_dec_len = 0
 
     for batch in tqdm(loader, desc="eval (baseline_llm)"):
-        batch = _move(batch, device, dtype)
+        batch = _move(batch, device)
         prompt_ids = batch["prompt_ids"]
         answer_ids = batch["answer_ids"]
         answer_labels = batch["answer_labels"]
-        full_mask = batch["attention_mask"]
-        V = batch["input_embeds"].size(1)
+        prompt_mask = batch["prompt_mask"]
+        answer_mask = batch["answer_mask"]
         B = prompt_ids.size(0)
-        # Real (non-pad) P + A slots seen by the decoder, per sample.
-        base_real_lens = (
-            full_mask[:, : prompt_ids.size(1)].sum(dim=1)
-            + full_mask[:, prompt_ids.size(1) + V :].sum(dim=1)
-        ).tolist()
+        P = prompt_ids.size(1)
+
+        attn = torch.cat([prompt_mask, answer_mask], dim=1)
+        base_real_lens = attn.sum(dim=1).tolist()
         total_dec_len += sum(base_real_lens)
         max_dec_len = max(max_dec_len, max(base_real_lens))
 
@@ -180,12 +199,9 @@ def eval_teacher_forcing_baseline_llm(
         answer_embs = embed_layer(answer_ids)
         decoder_input = torch.cat([prompt_embs, answer_embs], dim=1)
 
-        P = prompt_ids.size(1)
         ignore = torch.full((B, P), -100, dtype=answer_labels.dtype, device=device)
         labels = torch.cat([ignore, answer_labels], dim=1)
 
-        # Drop the vision span from the combined attention mask.
-        attn = torch.cat([full_mask[:, :P], full_mask[:, P + V:]], dim=1)
         out = model.decoder(inputs_embeds=decoder_input, attention_mask=attn, use_cache=False)
         logits = out.logits
 
@@ -194,9 +210,9 @@ def eval_teacher_forcing_baseline_llm(
         per_token_loss = loss_fct(shift_logits, shift_labels)
         mask = shift_labels != -100
         total_loss += per_token_loss[mask].sum().item()
-        total_tokens += mask.sum().item()
+        total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P - 1 : -1, :]
+        answer_logits = logits[:, P - 1:-1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -223,10 +239,9 @@ def eval_teacher_forcing_baseline_proj(
     proj: nn.Linear,
     loader: DataLoader,
     device: torch.device,
-    dtype: torch.dtype,
     max_samples: int,
 ) -> Dict[str, float]:
-    """Baseline: project embeddings directly to LLM space (single linear, no ViT)."""
+    """Baseline: text encoder → chunked pool → random linear projection → decoder (skip ViT)."""
     model.eval()
     proj.eval()
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
@@ -238,25 +253,29 @@ def eval_teacher_forcing_baseline_proj(
     max_dec_len = 0
 
     for batch in tqdm(loader, desc="eval (baseline_proj)"):
-        batch = _move(batch, device, dtype)
+        batch = _move(batch, device)
         B = batch["prompt_ids"].size(0)
-        real_lens = batch["attention_mask"].sum(dim=1).tolist()
-        total_dec_len += sum(real_lens)
-        max_dec_len = max(max_dec_len, max(real_lens))
+        pooled, vision_mask = _encode_source_for_baseline(
+            model, batch["source_ids"], batch["source_attention_mask"]
+        )
+        vision_embeds = proj(pooled)  # [B, V, llm_dim]
 
-        vision_embeds = proj(batch["input_embeds"])  # [B, V, llm_dim]
         embed_layer = model.decoder.get_input_embeddings()
         prompt_embs = embed_layer(batch["prompt_ids"])
         answer_embs = embed_layer(batch["answer_ids"])
         decoder_input = torch.cat([prompt_embs, vision_embeds, answer_embs], dim=1)
 
+        attn = torch.cat([batch["prompt_mask"], vision_mask, batch["answer_mask"]], dim=1)
         P = batch["prompt_ids"].size(1)
         V = vision_embeds.size(1)
         answer_labels = batch["answer_labels"]
         ignore = torch.full((B, P + V), -100, dtype=answer_labels.dtype, device=device)
         labels = torch.cat([ignore, answer_labels], dim=1)
 
-        attn = batch["attention_mask"]
+        real_lens = attn.sum(dim=1).tolist()
+        total_dec_len += sum(real_lens)
+        max_dec_len = max(max_dec_len, max(real_lens))
+
         out = model.decoder(inputs_embeds=decoder_input, attention_mask=attn, use_cache=False)
         logits = out.logits
 
@@ -265,9 +284,9 @@ def eval_teacher_forcing_baseline_proj(
         per_token_loss = loss_fct(shift_logits, shift_labels)
         mask = shift_labels != -100
         total_loss += per_token_loss[mask].sum().item()
-        total_tokens += mask.sum().item()
+        total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P + V - 1 : -1, :]
+        answer_logits = logits[:, P + V - 1:-1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -289,7 +308,7 @@ def eval_teacher_forcing_baseline_proj(
 
 
 # ---------------------------------------------------------------------------
-# Generation metrics (slow)
+# Generation metrics
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -297,13 +316,11 @@ def generate_answers(
     model: CVLM,
     loader: DataLoader,
     device: torch.device,
-    dtype: torch.dtype,
     max_new_tokens: int,
     max_samples: int,
     mode: str,
     proj: Optional[nn.Linear] = None,
 ) -> tuple[list[str], list[str]]:
-    """Generate answers and collect references. Returns (predictions, references)."""
     model.eval()
     tokenizer = model.tokenizer
     predictions: list[str] = []
@@ -311,27 +328,23 @@ def generate_answers(
     n_samples = 0
 
     for batch in tqdm(loader, desc=f"generate ({mode})"):
-        batch = _move(batch, device, dtype)
+        batch = _move(batch, device)
         B = batch["prompt_ids"].size(0)
-
-        P = batch["prompt_ids"].size(1)
-        V = batch["input_embeds"].size(1)
-        full_mask = batch["attention_mask"]
-        prompt_vision_mask = full_mask[:, : P + V]
-        prompt_only_mask = full_mask[:, :P]
+        prompt_mask = batch["prompt_mask"]
 
         if mode == "cvlm":
             gen_ids = model.generate(
-                batch["input_embeds"],
-                batch["prompt_ids"],
-                attention_mask=prompt_vision_mask,
+                source_input_ids=batch["source_ids"],
+                source_attention_mask=batch["source_attention_mask"],
+                prompt_ids=batch["prompt_ids"],
+                prompt_mask=prompt_mask,
                 max_new_tokens=max_new_tokens,
             )
         elif mode == "baseline_llm":
             prompt_embs = model.decoder.get_input_embeddings()(batch["prompt_ids"])
             gen_ids = model.decoder.generate(
                 inputs_embeds=prompt_embs,
-                attention_mask=prompt_only_mask,
+                attention_mask=prompt_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
@@ -339,12 +352,16 @@ def generate_answers(
             )
         elif mode == "baseline_proj":
             assert proj is not None
-            vision_embeds = proj(batch["input_embeds"])
+            pooled, vision_mask = _encode_source_for_baseline(
+                model, batch["source_ids"], batch["source_attention_mask"]
+            )
+            vision_embeds = proj(pooled)
             prompt_embs = model.decoder.get_input_embeddings()(batch["prompt_ids"])
             decoder_input = torch.cat([prompt_embs, vision_embeds], dim=1)
+            attn = torch.cat([prompt_mask, vision_mask], dim=1)
             gen_ids = model.decoder.generate(
                 inputs_embeds=decoder_input,
-                attention_mask=prompt_vision_mask,
+                attention_mask=attn,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
@@ -356,19 +373,20 @@ def generate_answers(
         pred_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         predictions.extend(pred_texts)
 
-        # Decode reference answers (non-padded tokens only)
         answer_ids = batch["answer_ids"]
         answer_labels = batch["answer_labels"]
         for i in range(B):
-            mask = answer_labels[i] != -100
-            ref_ids = answer_ids[i][mask]
+            m = answer_labels[i] != -100
+            ref_ids = answer_ids[i][m]
             references.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
 
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
 
-    return predictions[:max_samples] if max_samples > 0 else predictions, references[:max_samples] if max_samples > 0 else references
+    if max_samples > 0:
+        return predictions[:max_samples], references[:max_samples]
+    return predictions, references
 
 
 def compute_generation_metrics(predictions: list[str], references: list[str]) -> Dict[str, float]:
@@ -384,9 +402,7 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
         rl.append(scores["rougeL"].fmeasure)
 
     bleu = sacrebleu.corpus_bleu(predictions, [references])
-
     n_exact = sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip())
-
     return {
         "rouge1": sum(r1) / len(r1) if r1 else 0.0,
         "rouge2": sum(r2) / len(r2) if r2 else 0.0,
@@ -397,29 +413,33 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Compression metrics
 # ---------------------------------------------------------------------------
 
 def compute_compression_stats(
-    dataset,
-    tokenizer,
+    dataset: CvlmTrainDataset,
+    decoder_tokenizer,
+    compression_rate: int,
+    max_vision_len: int,
     max_samples: int,
 ) -> Dict[str, float]:
-    """Per-sample source-token and vision-length stats for the CVLM pipeline.
+    """Per-sample source-token and vision-length stats for the on-the-fly pipeline.
 
     Definitions
     -----------
     S_i : int
-        Number of tokens obtained by tokenizing ``record["input"]`` (the raw
-        source text) with the *decoder's* tokenizer. Using the LLM tokenizer
-        (not ModernBERT's) makes the number directly comparable with the
-        token budget that a plain-LLM baseline would consume.
+        Number of tokens obtained by tokenizing ``record["input"]`` with the
+        *decoder's* tokenizer (not ModernBERT's). This makes the number
+        directly comparable with the token budget a plain-LLM baseline would
+        consume.
     V_i : int
-        Number of rows in the pre-computed embedding sequence — i.e. the
-        length of the compressed context the decoder actually sees.
+        Number of compressed vision slots the decoder actually sees for this
+        sample. Derived as ``min(ceil(L_enc_i / compression_rate), max_vision_len)``
+        where ``L_enc_i`` is the source length in encoder tokens (after the
+        dataset filter, before truncation).
     P_i, A_i : int
-        Prompt / answer token counts (not collected here, but reported by the
-        main eval loop through the mean decoder input length).
+        Prompt / answer decoder-token counts (tracked by the per-mode eval
+        loops via ``prompt_len_mean_seen`` / ``answer`` side of the mask).
 
     Metrics returned
     ----------------
@@ -430,35 +450,33 @@ def compute_compression_stats(
         Distribution of V_i. Sanity checks that the compression stage is
         neither collapsing to 1 nor saturating at ``max_vision_len``.
     compression_ratio_mean, _median, _p10, _p90, _min, _max
-        Distribution of ``S_i / V_i`` — the headline "how many original
-        tokens each compressed slot represents". With
-        ``embed_dataset.py --compression_rate K`` the mean should sit near K
-        (it can differ because the source counts use the LLM tokenizer while
-        pooling was done in ModernBERT-token space).
+        Distribution of ``S_i / V_i``. With ``--compression_rate K`` the mean
+        should sit near K (it can differ because S_i uses the LLM tokenizer
+        while V_i is derived from the encoder tokenizer's length).
     n_compression_samples : int
         Number of samples the stats were computed over (≤ ``max_samples``).
 
-    Related metrics computed inside the per-mode eval loops (not here):
-    - ``decoder_input_len_mean`` / ``_max`` : mean / max of P_i + V_i + A_i,
-      a direct proxy for decoder memory and attention FLOPs.
-    - ``effective_context_reduction`` : S_i / (V_i + P_i), i.e. how many
-      source tokens each non-answer decoder slot stands in for.
-    - ``bits_per_source_token`` : joint quality/compression score, equal to
-      ``(sum of answer NLL in nats / ln 2) / sum(S_i)``. Lower = the model
-      needs fewer bits of answer-side cross-entropy per unit of source
-      content; comparable across different compression rates.
+    Related joint metrics computed in ``main`` (not here):
+    - ``decoder_input_len_mean`` / ``_max`` : mean / max of real P_i+V_i+A_i.
+    - ``effective_context_reduction`` : S_i / (V_i + P_i).
+    - ``bits_per_source_token`` : (answer NLL in nats / ln 2) / sum(S_i).
+      Lower = fewer bits of answer-side cross-entropy per unit of source.
     """
+    enc_tok = dataset._enc_tok
     S: list[int] = []
     V: list[int] = []
     n = len(dataset)
     limit = n if max_samples <= 0 else min(n, max_samples)
+    cr = max(int(compression_rate), 1)
     for idx in tqdm(range(limit), desc="compression stats"):
-        src_i = dataset._row_indices[idx]
-        emb = dataset._get_row(src_i)
-        v_len = int(emb.shape[0]) if emb.ndim == 2 else 1
-        row_id = int(dataset._indexes[src_i])
+        row_id = dataset._row_indices[idx]
         text = dataset._hf[row_id]["input"]
-        s_len = len(tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"])
+        s_len = len(decoder_tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"])
+        l_enc = len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"])
+        l_enc = min(l_enc, dataset.max_source_len)
+        v_len = min((l_enc + cr - 1) // cr, max_vision_len)
+        if v_len == 0:
+            v_len = 1
         S.append(s_len)
         V.append(v_len)
     S_arr = np.asarray(S, dtype=np.float64)
@@ -484,7 +502,7 @@ def compute_compression_stats(
 def bits_per_source_token(total_answer_nll_nats: float, total_source_tokens: int) -> float:
     """bits_per_source_token = (sum answer NLL in nats / ln 2) / sum(S_i).
 
-    Joint quality/compression metric. Expresses the model's answer-side
+    Joint quality/compression score. Expresses the model's answer-side
     cross-entropy in bits, normalised by the number of source-text tokens the
     compressed context stood in for. Lower is better, and it is directly
     comparable across runs with different compression rates (whereas raw
@@ -495,33 +513,25 @@ def bits_per_source_token(total_answer_nll_nats: float, total_source_tokens: int
     return (total_answer_nll_nats / math.log(2.0)) / float(total_source_tokens)
 
 
-def _move(batch: dict, device: torch.device, dtype: torch.dtype) -> dict:
-    out = {}
-    for k, v in batch.items():
-        if not torch.is_tensor(v):
-            out[k] = v
-            continue
-        if k == "input_embeds":
-            out[k] = v.to(device=device, dtype=dtype)
-        else:
-            out[k] = v.to(device=device)
-    return out
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_bf16 = device.type == "cuda" and not args.no_bf16
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    # Build model (no training init — frozen everything)
     model_args = ModelArguments(train=False)
     if args.model_name_or_path:
         model_args.model_name_or_path = args.model_name_or_path
     if args.vision_encoder_name:
         model_args.vision_encoder_name = args.vision_encoder_name
+    if args.text_encoder_name:
+        model_args.text_encoder_name = args.text_encoder_name
     model_args.max_vision_len = args.max_vision_len
+    model_args.compression_rate = args.compression_rate
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -533,33 +543,36 @@ def main() -> None:
     if args.checkpoint_path:
         print(f"Loading checkpoint: {args.checkpoint_path}")
         state_dict = load_file(args.checkpoint_path)
-        model.load_state_dict(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
 
     model.eval()
 
-    # Optional: direct projection baseline (random init, untrained)
     proj: Optional[nn.Linear] = None
     if args.mode == "baseline_proj":
-        embed_dim = model_args.embed_input_dim
+        embed_dim = model.text_encoder.config.hidden_size
         llm_dim = model.decoder.config.hidden_size
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
         proj = nn.Linear(embed_dim, llm_dim).to(device=device, dtype=dtype)
         proj.eval()
         print(f"baseline_proj: Linear({embed_dim} → {llm_dim}), random init")
 
-    # Dataset
-    tok_pad = model.tokenizer.pad_token_id
-    if tok_pad is None:
-        raise ValueError("Tokenizer must define pad_token")
-    collate = make_collate_fn(tok_pad)
+    dec_pad = model.tokenizer.pad_token_id
+    enc_pad = model.encoder_tokenizer.pad_token_id
+    if dec_pad is None or enc_pad is None:
+        raise ValueError("Both decoder and encoder tokenizers must define pad_token")
+    collate = make_collate_fn(dec_pad_id=dec_pad, enc_pad_id=enc_pad)
 
+    max_source_len = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
     dataset = CvlmTrainDataset(
-        embeddings_path=os.path.normpath(args.embeddings_path),
         hf_dataset_name=args.dataset_name,
         hf_split=args.dataset_split,
-        tokenizer_name=model_args.model_name_or_path,
+        decoder_tokenizer_name=model_args.model_name_or_path,
+        encoder_tokenizer_name=model_args.text_encoder_name,
         max_prompt_len=args.max_prompt_len,
         max_answer_len=args.max_answer_len,
-        max_vision_len=args.max_vision_len,
+        max_source_len=max_source_len,
+        max_samples=args.max_samples,
     )
     loader = DataLoader(
         dataset,
@@ -570,15 +583,14 @@ def main() -> None:
         drop_last=False,
     )
 
-    # Teacher-forcing metrics
     print(f"\n=== Teacher-forcing evaluation (mode={args.mode}) ===")
     if args.mode == "cvlm":
-        tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, dtype, args.max_samples)
+        tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
     elif args.mode == "baseline_llm":
-        tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, dtype, args.max_samples)
+        tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
     elif args.mode == "baseline_proj":
         assert proj is not None
-        tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, dtype, args.max_samples)
+        tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -591,9 +603,14 @@ def main() -> None:
           f"{tf_metrics.get('decoder_input_len_mean', 0):.1f} / "
           f"{tf_metrics.get('decoder_input_len_max', 0)}")
 
-    # Compression metrics (data-side; independent of the eval mode)
     print("\n=== Compression stats ===")
-    comp_stats = compute_compression_stats(dataset, model.tokenizer, args.max_samples)
+    comp_stats = compute_compression_stats(
+        dataset,
+        model.tokenizer,
+        compression_rate=args.compression_rate,
+        max_vision_len=args.max_vision_len,
+        max_samples=args.max_samples,
+    )
     for k in [
         "source_tokens_mean",
         "vision_len_mean", "vision_len_median", "vision_len_min", "vision_len_max",
@@ -604,7 +621,6 @@ def main() -> None:
     ]:
         print(f"  {k:28s}: {comp_stats[k]}")
 
-    # Joint quality/compression scores (require both sides — computed here).
     total_nll = float(tf_metrics.get("total_answer_nll_nats", 0.0))
     total_src = int(comp_stats.get("source_tokens_sum", 0))
     bps = bits_per_source_token(total_nll, total_src)
@@ -619,12 +635,11 @@ def main() -> None:
         print(f"  effective_context_reduction : {eff_reduction:.4f}  "
               f"(source_tokens_mean / (V_mean + P_mean))")
 
-    # Generation metrics (optional)
     gen_metrics: Dict[str, float] = {}
     if args.compute_generation_metrics:
         print(f"\n=== Generation evaluation (mode={args.mode}) ===")
         preds, refs = generate_answers(
-            model, loader, device, dtype, args.max_new_tokens, args.max_samples, args.mode, proj
+            model, loader, device, args.max_new_tokens, args.max_samples, args.mode, proj
         )
         gen_metrics = compute_generation_metrics(preds, refs)
         print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
@@ -633,7 +648,6 @@ def main() -> None:
         print(f"  BLEU-4:        {gen_metrics['bleu4']:.2f}")
         print(f"  Exact Match:   {gen_metrics['exact_match']:.4f}")
 
-    # Save results
     results = {
         **tf_metrics,
         **gen_metrics,
@@ -642,7 +656,6 @@ def main() -> None:
         "effective_context_reduction": eff_reduction,
     }
 
-    # TensorBoard logging (point at the same dir training used to get one view)
     if args.tensorboard_dir:
         from torch.utils.tensorboard import SummaryWriter
         run_name = args.tb_run_name or f"eval_{args.mode}"
@@ -650,22 +663,21 @@ def main() -> None:
         os.makedirs(tb_path, exist_ok=True)
         writer = SummaryWriter(log_dir=tb_path)
         step = int(args.global_step)
-        # Scalar metrics (everything numeric in results except the mode string).
         for k, v in results.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 writer.add_scalar(f"eval/{k}", float(v), step)
-        # Histogram of the per-sample compression ratios (re-tokenise once — cheap
-        # compared to generation — to get the raw distribution back).
+        # Histogram of per-sample compression ratios from comp_stats data.
         per_sample_ratios = []
         limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
+        cr = max(int(args.compression_rate), 1)
+        enc_tok = dataset._enc_tok
         for idx in range(limit):
-            src_i = dataset._row_indices[idx]
-            emb = dataset._get_row(src_i)
-            v_len = max(int(emb.shape[0] if emb.ndim == 2 else 1), 1)
-            row_id = int(dataset._indexes[src_i])
-            s_len = len(model.tokenizer(
-                dataset._hf[row_id]["input"], add_special_tokens=False, truncation=False
-            )["input_ids"])
+            row_id = dataset._row_indices[idx]
+            text = dataset._hf[row_id]["input"]
+            s_len = len(model.tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"])
+            l_enc = min(len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]),
+                        dataset.max_source_len)
+            v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)
             per_sample_ratios.append(s_len / v_len)
         if per_sample_ratios:
             writer.add_histogram("eval/compression_ratio_dist", np.asarray(per_sample_ratios), step)

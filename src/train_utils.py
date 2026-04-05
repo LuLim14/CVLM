@@ -71,11 +71,25 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def state_dict_for_safetensors(module: nn.Module) -> Dict[str, torch.Tensor]:
-    """Build a state dict safe for ``save_file``: clone later keys that share storage (tied LM heads)."""
+    """Build a state dict safe for ``save_file``.
+
+    - Keeps only parameters whose ``requires_grad`` is True. Frozen sub-modules
+      (decoder, text_encoder) are reloaded from their HF checkpoints at
+      `from_pretrained` time and don't need to live in our per-step ckpts.
+      This shrinks a 500+ MB checkpoint down to ~100 MB of trainable weights.
+    - Clones any later tensor that shares storage with an earlier one (tied
+      LM heads, etc.), which ``safetensors.save_file`` cannot represent.
+    """
+    # Build the set of parameter names we want to save (trainable only).
+    trainable_names: Set[str] = {
+        name for name, p in module.named_parameters() if p.requires_grad
+    }
     sd = module.state_dict()
     seen: Set[tuple] = set()
     out: Dict[str, torch.Tensor] = {}
     for name, t in sd.items():
+        if name not in trainable_names:
+            continue
         stor = t.untyped_storage()
         ident = (stor.data_ptr(), t.storage_offset(), tuple(t.shape), tuple(t.stride()))
         if ident in seen:
@@ -143,7 +157,11 @@ def load_cvlm_checkpoint(
 ) -> Tuple[int, int]:
     """Load weights and trainer state. Returns (local_epoch, global_step) from checkpoint."""
     state = load_file(model_path)
-    unwrap_model(model).load_state_dict(state, strict=True)
+    # strict=False because the checkpoint only contains trainable params;
+    # frozen sub-modules (decoder, text_encoder) were re-loaded from HF at init.
+    missing, unexpected = unwrap_model(model).load_state_dict(state, strict=False)
+    if unexpected:
+        print(f"load_cvlm_checkpoint: {len(unexpected)} unexpected keys in ckpt (ignored)")
     try:
         payload = torch.load(trainer_path, map_location=device, weights_only=False)
     except TypeError:

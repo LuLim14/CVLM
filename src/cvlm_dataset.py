@@ -1,4 +1,8 @@
-# Dataset + collation for CVLM (precomputed embeddings + HF text).
+# Dataset + collation for CVLM.
+#
+# The on-the-fly variant: the dataset yields raw token ids for (source, prompt,
+# answer). The model's frozen text encoder embeds `source_ids` at forward time,
+# so there is no precomputed embeddings cache anywhere.
 
 from __future__ import annotations
 
@@ -6,188 +10,156 @@ from typing import Any, Callable, Dict, List
 
 import numpy as np
 import torch
-from tqdm import tqdm
 from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 
-def _load_embeddings(path: str):
-    """Load embeddings saved by build_dataset/embed_dataset.py.
-
-    Supports the new npz format (indexes, flat, offsets) and, for backwards
-    compatibility, the legacy np.save(dict) format with per-row ragged arrays.
-    Returns (indexes, get_row) where get_row(i) -> np.ndarray of shape [V_i, H].
-    """
-    if path.endswith(".npz") or path.endswith(".npz.npz"):
-        data = np.load(path)
-        indexes = np.asarray(data["indexes"], dtype=np.int64)
-        flat = np.asarray(data["flat"], dtype=np.float32)
-        offsets = np.asarray(data["offsets"], dtype=np.int64)
-
-        def get_row(i: int) -> np.ndarray:
-            return flat[offsets[i]:offsets[i + 1]]
-
-        return indexes, get_row
-
-    # Legacy: np.save(dict(indexes=..., embeddings=list_of_arrays))
-    raw = np.load(path, allow_pickle=True)
-    data = raw.item()
-    indexes = np.asarray(data["indexes"], dtype=np.int64)
-    embeddings: List[np.ndarray] = list(data["embeddings"])
-
-    def get_row(i: int) -> np.ndarray:
-        e = np.asarray(embeddings[i], dtype=np.float32)
-        if e.ndim == 1:
-            e = e.reshape(1, -1)
-        return e
-
-    return indexes, get_row
-
-
-def _sample_within_caps(
-    vision_len: int,
-    prompt_text: str,
-    answer_text: str,
-    tokenizer: PreTrainedTokenizer,
-    max_prompt_len: int,
-    max_answer_len: int,
-    max_vision_len: int,
-) -> bool:
-    if vision_len <= 0 or vision_len > max_vision_len:
-        return False
-    p = tokenizer(prompt_text, add_special_tokens=False, truncation=False)
-    a = tokenizer(answer_text, add_special_tokens=False, truncation=False)
-    if len(p["input_ids"]) > max_prompt_len:
-        return False
-    if len(a["input_ids"]) > max_answer_len:
-        return False
-    return True
-
-
 class CvlmTrainDataset(Dataset):
-    """Pairs embeddings.npz rows with HuggingFace rows via indexes."""
+    """Raw-text dataset: yields encoder source ids + decoder prompt/answer ids."""
 
     def __init__(
         self,
-        embeddings_path: str,
         hf_dataset_name: str,
         hf_split: str,
-        tokenizer_name: str,
+        decoder_tokenizer_name: str,
+        encoder_tokenizer_name: str,
         max_prompt_len: int,
         max_answer_len: int,
-        max_vision_len: int,
+        max_source_len: int,
+        max_samples: int = 0,
     ) -> None:
-        self._indexes, self._get_row = _load_embeddings(embeddings_path)
         self._hf: HFDataset = load_dataset(hf_dataset_name, split=hf_split)
+        if max_samples > 0:
+            self._hf = self._hf.select(range(min(max_samples, len(self._hf))))
         self.max_prompt_len = max_prompt_len
         self.max_answer_len = max_answer_len
-        self.max_vision_len = max_vision_len
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        # padding_side is not actually used (collator pads manually left/right),
-        # but set it for any ad-hoc tokenizer calls.
-        self.tokenizer.padding_side = "left"
+        self.max_source_len = max_source_len
 
-        self._row_indices: List[int] = []
-        n_src = len(self._indexes)
-        for i in tqdm(range(n_src), desc="Filtering CVLM samples"):
-            emb_i = self._get_row(i)
-            row_id = int(self._indexes[i])
-            record = self._hf[row_id]
-            if _sample_within_caps(
-                emb_i.shape[0] if emb_i.ndim == 2 else 1,
-                record["input"],
-                record["answer"],
-                self.tokenizer,
-                self.max_prompt_len,
-                self.max_answer_len,
-                self.max_vision_len,
-            ):
-                self._row_indices.append(i)
-        n_kept = len(self._row_indices)
-        print(
-            f"CvlmTrainDataset: kept {n_kept}/{n_src} samples "
-            f"(prompt_tokens<={max_prompt_len}, answer_tokens<={max_answer_len}, "
-            f"vision_len<={max_vision_len}; no truncation)"
+        self._dec_tok: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
+            decoder_tokenizer_name, use_fast=False
         )
-        if n_kept == 0:
-            raise RuntimeError(
-                "No samples passed length filters; increase caps or check data."
+        if self._dec_tok.pad_token is None:
+            self._dec_tok.pad_token = self._dec_tok.eos_token
+        self._enc_tok: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
+            encoder_tokenizer_name, use_fast=True, trust_remote_code=True
+        )
+        if self._enc_tok.pad_token is None:
+            self._enc_tok.pad_token = self._enc_tok.eos_token or self._enc_tok.cls_token
+        self.dec_pad_id: int = self._dec_tok.pad_token_id
+        self.enc_pad_id: int = self._enc_tok.pad_token_id
+
+        # Vectorised length pass: one batched fast-tokenizer call per field.
+        # PwC rows have "input" (source document) and "answer".
+        inputs = list(self._hf["input"])
+        answers = list(self._hf["answer"])
+
+        print(f"Tokenising {len(inputs)} samples to compute length filter...")
+        enc_lens = self._batched_lengths(self._enc_tok, inputs)       # source lens in encoder tokens
+        dec_input_lens = self._batched_lengths(self._dec_tok, inputs) # prompt lens in decoder tokens
+        dec_answer_lens = self._batched_lengths(self._dec_tok, answers)
+
+        keep = []
+        for i in range(len(inputs)):
+            if enc_lens[i] <= 0 or enc_lens[i] > max_source_len:
+                continue
+            if dec_input_lens[i] > max_prompt_len:
+                continue
+            if dec_answer_lens[i] > max_answer_len:
+                continue
+            keep.append(i)
+        self._row_indices: List[int] = keep
+        print(
+            f"CvlmTrainDataset: kept {len(keep)}/{len(inputs)} samples "
+            f"(source_tokens<={max_source_len}, prompt_tokens<={max_prompt_len}, "
+            f"answer_tokens<={max_answer_len})"
+        )
+        if not keep:
+            raise RuntimeError("No samples passed length filters; loosen caps.")
+
+    @staticmethod
+    def _batched_lengths(tokenizer: PreTrainedTokenizer, texts: List[str], batch: int = 1024) -> List[int]:
+        out: List[int] = []
+        for start in range(0, len(texts), batch):
+            enc = tokenizer(
+                [str(t) for t in texts[start:start + batch]],
+                add_special_tokens=False,
+                truncation=False,
+                padding=False,
+                return_attention_mask=False,
             )
+            out.extend(len(ids) for ids in enc["input_ids"])
+        return out
 
     def __len__(self) -> int:
         return len(self._row_indices)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        src_i = self._row_indices[idx]
-        emb = self._get_row(src_i).astype(np.float32, copy=False)
-        if emb.ndim == 1:
-            emb = emb.reshape(1, -1)
-        elif emb.ndim != 2:
-            raise ValueError(f"Expected embedding shape [D] or [V, D], got {emb.shape}")
-        input_embeds = torch.from_numpy(np.ascontiguousarray(emb))
-        row_id = int(self._indexes[src_i])
+        row_id = self._row_indices[idx]
         record = self._hf[row_id]
-        p = self.tokenizer(record["input"], add_special_tokens=False, truncation=False, return_tensors="pt")
-        a = self.tokenizer(record["answer"], add_special_tokens=False, truncation=False, return_tensors="pt")
+        src = self._enc_tok(
+            str(record["input"]),
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_source_len,
+            return_tensors=None,
+        )
+        prompt = self._dec_tok(
+            str(record["input"]), add_special_tokens=False, truncation=False
+        )
+        answer = self._dec_tok(
+            str(record["answer"]), add_special_tokens=False, truncation=False
+        )
         return {
-            "input_embeds": input_embeds,
-            "prompt_ids": p["input_ids"].squeeze(0).long(),
-            "answer_ids": a["input_ids"].squeeze(0).long(),
+            "source_ids": torch.as_tensor(src["input_ids"], dtype=torch.long),
+            "prompt_ids": torch.as_tensor(prompt["input_ids"], dtype=torch.long),
+            "answer_ids": torch.as_tensor(answer["input_ids"], dtype=torch.long),
         }
 
 
-def make_collate_fn(pad_token_id: int) -> Callable[[List[Dict[str, Any]]], Dict[str, torch.Tensor]]:
+def make_collate_fn(
+    dec_pad_id: int,
+    enc_pad_id: int,
+) -> Callable[[List[Dict[str, Any]]], Dict[str, torch.Tensor]]:
     def collate_cvlm_batch(samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         b = len(samples)
-        # Vision: right-pad (embedding rows), record real lengths for the attn mask.
-        max_v = max(s["input_embeds"].shape[0] for s in samples)
-        d = samples[0]["input_embeds"].shape[1]
-        input_embeds = torch.zeros(b, max_v, d, dtype=samples[0]["input_embeds"].dtype)
-        vision_lens = torch.zeros(b, dtype=torch.long)
-        for i, s in enumerate(samples):
-            t = s["input_embeds"]
-            input_embeds[i, : t.shape[0], :] = t
-            vision_lens[i] = t.shape[0]
 
-        # Prompt: LEFT-pad so real prompt tokens sit flush against the vision block.
+        # Source (encoder input): right-pad with encoder pad id.
+        max_s = max(s["source_ids"].shape[0] for s in samples)
+        source_ids = torch.full((b, max_s), enc_pad_id, dtype=torch.long)
+        source_attention_mask = torch.zeros(b, max_s, dtype=torch.long)
+
+        # Prompt: LEFT-pad so real tokens sit flush against the vision block.
         max_p = max(s["prompt_ids"].shape[0] for s in samples)
+        prompt_ids = torch.full((b, max_p), dec_pad_id, dtype=torch.long)
+        prompt_mask = torch.zeros(b, max_p, dtype=torch.long)
+
         # Answer: right-pad (standard).
         max_a = max(s["answer_ids"].shape[0] for s in samples)
-
-        prompt_ids = torch.full((b, max_p), pad_token_id, dtype=torch.long)
-        answer_ids = torch.full((b, max_a), pad_token_id, dtype=torch.long)
+        answer_ids = torch.full((b, max_a), dec_pad_id, dtype=torch.long)
         answer_labels = torch.full((b, max_a), -100, dtype=torch.long)
-        prompt_mask = torch.zeros(b, max_p, dtype=torch.long)
-        vision_mask = torch.zeros(b, max_v, dtype=torch.long)
         answer_mask = torch.zeros(b, max_a, dtype=torch.long)
 
         for i, s in enumerate(samples):
-            pids = s["prompt_ids"]
-            aids = s["answer_ids"]
-            pl, al = pids.shape[0], aids.shape[0]
-            # left-pad prompt
+            sids, pids, aids = s["source_ids"], s["prompt_ids"], s["answer_ids"]
+            sl, pl, al = sids.shape[0], pids.shape[0], aids.shape[0]
+            source_ids[i, :sl] = sids
+            source_attention_mask[i, :sl] = 1
             prompt_ids[i, max_p - pl:] = pids
             prompt_mask[i, max_p - pl:] = 1
-            # right-pad answer
             answer_ids[i, :al] = aids
             answer_labels[i, :al] = aids
             answer_mask[i, :al] = 1
-            # vision mask: first vision_lens[i] positions are valid
-            vision_mask[i, : vision_lens[i]] = 1
-
-        attention_mask = torch.cat([prompt_mask, vision_mask, answer_mask], dim=1)
 
         return {
-            "input_embeds": input_embeds,
+            "source_ids": source_ids,
+            "source_attention_mask": source_attention_mask,
             "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
             "answer_ids": answer_ids,
             "answer_labels": answer_labels,
-            "attention_mask": attention_mask,
-            "vision_lens": vision_lens,
+            "answer_mask": answer_mask,
         }
 
     return collate_cvlm_batch
