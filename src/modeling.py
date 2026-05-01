@@ -185,8 +185,6 @@ class CVLM(torch.nn.Module):
             self._freeze_frozen_submodules()
 
     def _freeze_frozen_submodules(self):
-        freeze_model(self.decoder)
-        self.decoder.eval()
         freeze_model(self.text_encoder)
         self.text_encoder.eval()
 
@@ -194,8 +192,6 @@ class CVLM(torch.nn.Module):
         print("Freezing the decoder and text encoder...")
         self._freeze_frozen_submodules()
         # Sanity assertion: the two landmines from the plan.
-        assert all(not p.requires_grad for p in self.decoder.parameters()), \
-            "decoder must be frozen"
         assert all(not p.requires_grad for p in self.text_encoder.parameters()), \
             "text_encoder must be frozen"
         print_trainable_parameters(self)

@@ -19,6 +19,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+# Ignore ~/.local site-packages so the conda env's torch wins (avoids
+# `libtorch_cuda.so: undefined symbol: ncclDevCommDestroy` from a user-site
+# torch built against a newer NCCL than the system's).
+export PYTHONNOUSERSITE=1
 
 # -----------------------------------------------------------------------------
 # Configuration (override by exporting env vars before running the script).
@@ -31,9 +35,9 @@ MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM-135M-Instruct}"
 TEXT_ENCODER_NAME="${TEXT_ENCODER_NAME:-answerdotai/ModernBERT-base}"
 
 # Train
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
-LR="${LR:-1e-5}"
+LR="${LR:-1e-4}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_ANSWER_LEN="${MAX_ANSWER_LEN:-1024}"
 MAX_VISION_LEN="${MAX_VISION_LEN:-256}"
@@ -41,15 +45,24 @@ MAX_SOURCE_LEN="${MAX_SOURCE_LEN:-0}"      # 0 = compression_rate * max_vision_l
 COMPRESSION_RATE="${COMPRESSION_RATE:-4}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"            # cap HF dataset rows; 0 = all
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-LOG_INTERVAL="${LOG_INTERVAL:-10}"
+LOG_INTERVAL="${LOG_INTERVAL:-350}"
 SAVE_INTERVAL_STEPS="${SAVE_INTERVAL_STEPS:-0}"
 NPROC="${NPROC:-1}"
+# Linear warmup stabilises the first ~100 optimizer steps. With the projectors
+# + ViT freshly initialised, early grad norms can spike above 100; without
+# warmup clip=1.0 silently discards most of those updates.
+ENABLE_WARMUP="${ENABLE_WARMUP:-1}"
+WARMUP_STEPS="${WARMUP_STEPS:-100}"
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-${BATCH_SIZE}}"
-EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm}"   # space-separated
+# Default eval suite covers: cvlm (method), cvlm_shuffle (source-relevance sanity
+# check), baseline_llm (no-document lower bound), baseline_llm_full (oracle
+# upper bound with full document), baseline_proj (random-projection ablation).
+EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm baseline_llm_full baseline_proj}"
+EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation metrics
 
 TB_DIR="${OUTPUT_DIR}/tb"
 LOG_FILE="${OUTPUT_DIR}/pipeline.log"
@@ -69,6 +82,9 @@ echo "  MAX_VISION_LEN    = ${MAX_VISION_LEN}"
 echo "  MAX_SOURCE_LEN    = ${MAX_SOURCE_LEN} (0 = cr*max_vision_len)"
 echo "  COMPRESSION_RATE  = ${COMPRESSION_RATE}"
 echo "  MAX_SAMPLES       = ${MAX_SAMPLES} (0 = all)"
+echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
+echo "  EVAL_MODES        = ${EVAL_MODES}"
+echo "  EVAL_COMPUTE_GEN  = ${EVAL_COMPUTE_GEN}"
 echo "  TB_DIR            = ${TB_DIR}"
 echo "  LOG_FILE          = ${LOG_FILE}"
 echo "======================================================================"
@@ -76,8 +92,12 @@ echo "TensorBoard:  tensorboard --logdir ${TB_DIR} --port 6006 --bind_all"
 echo "======================================================================"
 
 # -----------------------------------------------------------------------------
-# Step 1/2: Train
+# Step 1/2: Train  (skip by exporting SKIP_TRAIN=1 to resume at eval only)
 # -----------------------------------------------------------------------------
+SKIP_TRAIN="${SKIP_TRAIN:-0}"
+if [[ "${SKIP_TRAIN}" == "1" ]]; then
+  echo; echo "===== Step 1/2: SKIPPED (SKIP_TRAIN=1) ====="
+else
 echo; echo "===== Step 1/2: Train CVLM -> ${OUTPUT_DIR} ====="
 TRAIN_ARGS=(
   "${ROOT}/src/train_cvlm.py"
@@ -99,10 +119,14 @@ TRAIN_ARGS=(
   --save_interval_steps "${SAVE_INTERVAL_STEPS}"
   --tensorboard_dir "${TB_DIR}/train"
 )
+if [[ "${ENABLE_WARMUP}" == "1" ]]; then
+  TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
+fi
 if [[ "${NPROC}" -gt 1 ]]; then
   torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
 else
   python "${TRAIN_ARGS[@]}"
+fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -121,24 +145,30 @@ echo; echo "===== Step 2/2: Eval checkpoint ${CKPT} (step=${STEP}) ====="
 
 for MODE in ${EVAL_MODES}; do
   echo; echo "----- eval mode=${MODE} -----"
-  python "${ROOT}/src/eval_cvlm.py" \
-    --checkpoint_path "${CKPT}" \
-    --dataset_name "${DATASET_NAME}" \
-    --dataset_split "${EVAL_SPLIT}" \
-    --model_name_or_path "${MODEL_NAME}" \
-    --text_encoder_name "${TEXT_ENCODER_NAME}" \
-    --compression_rate "${COMPRESSION_RATE}" \
-    --mode "${MODE}" \
-    --max_samples "${EVAL_MAX_SAMPLES}" \
-    --batch_size "${EVAL_BATCH_SIZE}" \
-    --max_prompt_len "${MAX_PROMPT_LEN}" \
-    --max_answer_len "${MAX_ANSWER_LEN}" \
-    --max_vision_len "${MAX_VISION_LEN}" \
-    --max_source_len "${MAX_SOURCE_LEN}" \
-    --tensorboard_dir "${TB_DIR}" \
-    --tb_run_name "eval_${MODE}" \
-    --global_step "${STEP}" \
+  EVAL_CMD=(
+    python "${ROOT}/src/eval_cvlm.py"
+    --checkpoint_path "${CKPT}"
+    --dataset_name "${DATASET_NAME}"
+    --dataset_split "${EVAL_SPLIT}"
+    --model_name_or_path "${MODEL_NAME}"
+    --text_encoder_name "${TEXT_ENCODER_NAME}"
+    --compression_rate "${COMPRESSION_RATE}"
+    --mode "${MODE}"
+    --max_samples "${EVAL_MAX_SAMPLES}"
+    --batch_size "${EVAL_BATCH_SIZE}"
+    --max_prompt_len "${MAX_PROMPT_LEN}"
+    --max_answer_len "${MAX_ANSWER_LEN}"
+    --max_vision_len "${MAX_VISION_LEN}"
+    --max_source_len "${MAX_SOURCE_LEN}"
+    --tensorboard_dir "${TB_DIR}"
+    --tb_run_name "eval_${MODE}"
+    --global_step "${STEP}"
     --output_json "${OUTPUT_DIR}/eval_${MODE}.json"
+  )
+  if [[ "${EVAL_COMPUTE_GEN}" == "1" ]]; then
+    EVAL_CMD+=( --compute_generation_metrics )
+  fi
+  "${EVAL_CMD[@]}"
 done
 
 echo

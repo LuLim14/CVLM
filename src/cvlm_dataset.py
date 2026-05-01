@@ -51,20 +51,22 @@ class CvlmTrainDataset(Dataset):
         self.enc_pad_id: int = self._enc_tok.pad_token_id
 
         # Vectorised length pass: one batched fast-tokenizer call per field.
-        # PwC rows have "input" (source document) and "answer".
+        # PwC rows have "input" (source document to compress), "prompt" (the
+        # user's question about the document), and "answer".
         inputs = list(self._hf["input"])
+        prompts = list(self._hf["prompt"])
         answers = list(self._hf["answer"])
 
         print(f"Tokenising {len(inputs)} samples to compute length filter...")
-        enc_lens = self._batched_lengths(self._enc_tok, inputs)       # source lens in encoder tokens
-        dec_input_lens = self._batched_lengths(self._dec_tok, inputs) # prompt lens in decoder tokens
+        enc_lens = self._batched_lengths(self._enc_tok, inputs)        # source lens in encoder tokens
+        dec_prompt_lens = self._batched_lengths(self._dec_tok, prompts)  # question lens in decoder tokens
         dec_answer_lens = self._batched_lengths(self._dec_tok, answers)
 
         keep = []
         for i in range(len(inputs)):
             if enc_lens[i] <= 0 or enc_lens[i] > max_source_len:
                 continue
-            if dec_input_lens[i] > max_prompt_len:
+            if dec_prompt_lens[i] > max_prompt_len:
                 continue
             if dec_answer_lens[i] > max_answer_len:
                 continue
@@ -105,15 +107,26 @@ class CvlmTrainDataset(Dataset):
             max_length=self.max_source_len,
             return_tensors=None,
         )
+        # Prompt is the user's *question* about the document, not the document
+        # itself. The document goes into `source_ids` (to be compressed into
+        # vision tokens); the question stays as raw prompt tokens.
         prompt = self._dec_tok(
-            str(record["input"]), add_special_tokens=False, truncation=False
+            str(record["prompt"]), add_special_tokens=False, truncation=False
         )
         answer = self._dec_tok(
             str(record["answer"]), add_special_tokens=False, truncation=False
         )
+        # full_prompt_ids = decoder-tokenised(document + question). Only used by
+        # the eval `baseline_llm_full` oracle (upper-bound LLM that sees the raw
+        # uncompressed document). Training does not consume this field.
+        full_prompt_text = str(record["input"]) + "\n\n" + str(record["prompt"])
+        full_prompt = self._dec_tok(
+            full_prompt_text, add_special_tokens=False, truncation=False
+        )
         return {
             "source_ids": torch.as_tensor(src["input_ids"], dtype=torch.long),
             "prompt_ids": torch.as_tensor(prompt["input_ids"], dtype=torch.long),
+            "full_prompt_ids": torch.as_tensor(full_prompt["input_ids"], dtype=torch.long),
             "answer_ids": torch.as_tensor(answer["input_ids"], dtype=torch.long),
         }
 
@@ -135,6 +148,13 @@ def make_collate_fn(
         prompt_ids = torch.full((b, max_p), dec_pad_id, dtype=torch.long)
         prompt_mask = torch.zeros(b, max_p, dtype=torch.long)
 
+        # Full prompt (doc + question) for the baseline_llm_full oracle.
+        has_full = "full_prompt_ids" in samples[0]
+        if has_full:
+            max_fp = max(s["full_prompt_ids"].shape[0] for s in samples)
+            full_prompt_ids = torch.full((b, max_fp), dec_pad_id, dtype=torch.long)
+            full_prompt_mask = torch.zeros(b, max_fp, dtype=torch.long)
+
         # Answer: right-pad (standard).
         max_a = max(s["answer_ids"].shape[0] for s in samples)
         answer_ids = torch.full((b, max_a), dec_pad_id, dtype=torch.long)
@@ -151,8 +171,13 @@ def make_collate_fn(
             answer_ids[i, :al] = aids
             answer_labels[i, :al] = aids
             answer_mask[i, :al] = 1
+            if has_full:
+                fpids = s["full_prompt_ids"]
+                fpl = fpids.shape[0]
+                full_prompt_ids[i, max_fp - fpl:] = fpids
+                full_prompt_mask[i, max_fp - fpl:] = 1
 
-        return {
+        out = {
             "source_ids": source_ids,
             "source_attention_mask": source_attention_mask,
             "prompt_ids": prompt_ids,
@@ -161,5 +186,9 @@ def make_collate_fn(
             "answer_labels": answer_labels,
             "answer_mask": answer_mask,
         }
+        if has_full:
+            out["full_prompt_ids"] = full_prompt_ids
+            out["full_prompt_mask"] = full_prompt_mask
+        return out
 
     return collate_cvlm_batch

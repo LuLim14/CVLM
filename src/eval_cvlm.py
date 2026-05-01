@@ -26,6 +26,12 @@ from tqdm import tqdm
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate CVLM (on-the-fly encoder variant)")
     p.add_argument("--checkpoint_path", type=str, default="", help="Path to model_step_*.safetensors")
+    p.add_argument(
+        "--sft_model_path",
+        type=str,
+        default="",
+        help="HF directory produced by train_sft.py. Required when --mode sft.",
+    )
     p.add_argument("--dataset_name", type=str, default="sggetao/PwC")
     p.add_argument("--dataset_split", type=str, default="test")
     p.add_argument("--model_name_or_path", type=str, default=None)
@@ -44,7 +50,14 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="cvlm",
-        choices=["cvlm", "baseline_llm", "baseline_proj"],
+        choices=[
+            "cvlm",
+            "cvlm_shuffle",       # sanity: shuffle source tokens before encoder
+            "baseline_llm",        # lower bound: question only, no document
+            "baseline_llm_full",   # upper bound: question + full document text
+            "baseline_proj",       # random linear projection, skips ViT
+            "sft",                 # SFT-trained decoder loaded from --sft_model_path
+        ],
     )
     p.add_argument("--compute_generation_metrics", action="store_true")
     p.add_argument("--output_json", type=str, default="")
@@ -93,7 +106,15 @@ def eval_teacher_forcing_cvlm(
     loader: DataLoader,
     device: torch.device,
     max_samples: int,
+    shuffle_source: bool = False,
 ) -> Dict[str, float]:
+    """Teacher-forcing eval for CVLM.
+
+    If ``shuffle_source`` is True, permute each sample's real source tokens
+    before they hit the text encoder. A well-conditioned CVLM should get
+    materially worse PPL on shuffled input; a model that ignores the vision
+    span will barely move.
+    """
     model.eval()
     loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
     total_loss = 0.0
@@ -105,11 +126,25 @@ def eval_teacher_forcing_cvlm(
     total_v_real = 0
     total_p_real = 0
 
-    for batch in tqdm(loader, desc="eval (cvlm)"):
+    desc = "eval (cvlm_shuffle)" if shuffle_source else "eval (cvlm)"
+    for batch in tqdm(loader, desc=desc):
         batch = _move(batch, device)
+        source_ids = batch["source_ids"]
+        source_mask = batch["source_attention_mask"]
+        if shuffle_source:
+            # Permute only the real positions of each sample so padding stays
+            # at the tail. This preserves the token distribution but destroys
+            # all order information the encoder could exploit.
+            shuffled = source_ids.clone()
+            for i in range(shuffled.size(0)):
+                n_real = int(source_mask[i].sum().item())
+                if n_real > 1:
+                    perm = torch.randperm(n_real, device=shuffled.device)
+                    shuffled[i, :n_real] = source_ids[i, :n_real][perm]
+            source_ids = shuffled
         out = model(
-            source_input_ids=batch["source_ids"],
-            source_attention_mask=batch["source_attention_mask"],
+            source_input_ids=source_ids,
+            source_attention_mask=source_mask,
             prompt_ids=batch["prompt_ids"],
             answer_ids=batch["answer_ids"],
             answer_labels=batch["answer_labels"],
@@ -234,6 +269,169 @@ def eval_teacher_forcing_baseline_llm(
 
 
 @torch.no_grad()
+def eval_teacher_forcing_baseline_llm_full(
+    model: CVLM,
+    loader: DataLoader,
+    device: torch.device,
+    max_samples: int,
+) -> Dict[str, float]:
+    """Oracle baseline: full (document + question) text as the decoder prompt.
+
+    Uses ``full_prompt_ids`` from the collator (document + blank line + question).
+    No vision span. This is the uncompressed upper bound the CVLM must approach
+    while using far fewer tokens.
+    """
+    model.eval()
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+    n_samples = 0
+    total_dec_len = 0
+    max_dec_len = 0
+    total_fp_real = 0
+
+    for batch in tqdm(loader, desc="eval (baseline_llm_full)"):
+        batch = _move(batch, device)
+        if "full_prompt_ids" not in batch:
+            raise RuntimeError(
+                "baseline_llm_full needs `full_prompt_ids` from the collator; "
+                "re-generate the dataset with the updated cvlm_dataset.py."
+            )
+        prompt_ids = batch["full_prompt_ids"]
+        prompt_mask = batch["full_prompt_mask"]
+        answer_ids = batch["answer_ids"]
+        answer_labels = batch["answer_labels"]
+        answer_mask = batch["answer_mask"]
+        B = prompt_ids.size(0)
+        P = prompt_ids.size(1)
+
+        attn = torch.cat([prompt_mask, answer_mask], dim=1)
+        real_lens = attn.sum(dim=1).tolist()
+        total_dec_len += sum(real_lens)
+        max_dec_len = max(max_dec_len, max(real_lens))
+        total_fp_real += int(prompt_mask.sum().item())
+
+        embed_layer = model.decoder.get_input_embeddings()
+        decoder_input = torch.cat(
+            [embed_layer(prompt_ids), embed_layer(answer_ids)], dim=1
+        )
+
+        ignore = torch.full((B, P), -100, dtype=answer_labels.dtype, device=device)
+        labels = torch.cat([ignore, answer_labels], dim=1)
+
+        out = model.decoder(inputs_embeds=decoder_input, attention_mask=attn, use_cache=False)
+        logits = out.logits
+
+        shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        shift_labels = labels[:, 1:].reshape(-1)
+        per_tok = loss_fct(shift_logits, shift_labels)
+        mask = shift_labels != -100
+        total_loss += per_tok[mask].sum().item()
+        total_tokens += int(mask.sum().item())
+
+        answer_logits = logits[:, P - 1:-1, :]
+        preds = answer_logits.argmax(dim=-1)
+        ans_mask = answer_labels != -100
+        total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        n_samples += B
+        if 0 < max_samples <= n_samples:
+            break
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    return {
+        "perplexity": math.exp(min(avg_loss, 30)),
+        "token_accuracy": total_correct / max(total_tokens, 1),
+        "avg_loss": avg_loss,
+        "n_samples": n_samples,
+        "decoder_input_len_mean": total_dec_len / max(n_samples, 1),
+        "decoder_input_len_max": int(max_dec_len),
+        "full_prompt_len_mean_seen": total_fp_real / max(n_samples, 1),
+        "total_answer_nll_nats": total_loss,
+        "total_answer_tokens": total_tokens,
+    }
+
+
+@torch.no_grad()
+def eval_teacher_forcing_sft(
+    decoder: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    max_samples: int,
+) -> Dict[str, float]:
+    """SFT-trained decoder eval: same input format as baseline_llm_full
+    (`full_prompt_ids` = document + blank line + question, then answer), but
+    runs against a bare HF causal LM rather than the CVLM wrapper's frozen
+    decoder. Output schema matches baseline_llm_full for direct comparison.
+    """
+    decoder.eval()
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
+    n_samples = 0
+    total_dec_len = 0
+    max_dec_len = 0
+    total_fp_real = 0
+
+    for batch in tqdm(loader, desc="eval (sft)"):
+        batch = _move(batch, device)
+        if "full_prompt_ids" not in batch:
+            raise RuntimeError(
+                "sft eval needs `full_prompt_ids` from the collator; "
+                "the dataset must be CvlmTrainDataset (already produces this)."
+            )
+        prompt_ids = batch["full_prompt_ids"]
+        prompt_mask = batch["full_prompt_mask"]
+        answer_ids = batch["answer_ids"]
+        answer_labels = batch["answer_labels"]
+        answer_mask = batch["answer_mask"]
+        B = prompt_ids.size(0)
+        P = prompt_ids.size(1)
+
+        attn = torch.cat([prompt_mask, answer_mask], dim=1)
+        real_lens = attn.sum(dim=1).tolist()
+        total_dec_len += sum(real_lens)
+        max_dec_len = max(max_dec_len, max(real_lens))
+        total_fp_real += int(prompt_mask.sum().item())
+
+        input_ids = torch.cat([prompt_ids, answer_ids], dim=1)
+        ignore = torch.full((B, P), -100, dtype=answer_labels.dtype, device=device)
+        labels = torch.cat([ignore, answer_labels], dim=1)
+
+        out = decoder(input_ids=input_ids, attention_mask=attn, use_cache=False)
+        logits = out.logits
+
+        shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        shift_labels = labels[:, 1:].reshape(-1)
+        per_tok = loss_fct(shift_logits, shift_labels)
+        mask = shift_labels != -100
+        total_loss += per_tok[mask].sum().item()
+        total_tokens += int(mask.sum().item())
+
+        answer_logits = logits[:, P - 1:-1, :]
+        preds = answer_logits.argmax(dim=-1)
+        ans_mask = answer_labels != -100
+        total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
+        n_samples += B
+        if 0 < max_samples <= n_samples:
+            break
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    return {
+        "perplexity": math.exp(min(avg_loss, 30)),
+        "token_accuracy": total_correct / max(total_tokens, 1),
+        "avg_loss": avg_loss,
+        "n_samples": n_samples,
+        "decoder_input_len_mean": total_dec_len / max(n_samples, 1),
+        "decoder_input_len_max": int(max_dec_len),
+        "full_prompt_len_mean_seen": total_fp_real / max(n_samples, 1),
+        "total_answer_nll_nats": total_loss,
+        "total_answer_tokens": total_tokens,
+    }
+
+
+@torch.no_grad()
 def eval_teacher_forcing_baseline_proj(
     model: CVLM,
     proj: nn.Linear,
@@ -313,16 +511,24 @@ def eval_teacher_forcing_baseline_proj(
 
 @torch.no_grad()
 def generate_answers(
-    model: CVLM,
+    model: Optional[CVLM],
     loader: DataLoader,
     device: torch.device,
     max_new_tokens: int,
     max_samples: int,
     mode: str,
     proj: Optional[nn.Linear] = None,
+    sft_decoder: Optional[nn.Module] = None,
+    sft_tokenizer=None,
 ) -> tuple[list[str], list[str]]:
-    model.eval()
-    tokenizer = model.tokenizer
+    if mode == "sft":
+        assert sft_decoder is not None and sft_tokenizer is not None
+        sft_decoder.eval()
+        tokenizer = sft_tokenizer
+    else:
+        assert model is not None
+        model.eval()
+        tokenizer = model.tokenizer
     predictions: list[str] = []
     references: list[str] = []
     n_samples = 0
@@ -332,9 +538,19 @@ def generate_answers(
         B = batch["prompt_ids"].size(0)
         prompt_mask = batch["prompt_mask"]
 
-        if mode == "cvlm":
+        if mode == "cvlm" or mode == "cvlm_shuffle":
+            src_ids = batch["source_ids"]
+            if mode == "cvlm_shuffle":
+                src_mask = batch["source_attention_mask"]
+                shuffled = src_ids.clone()
+                for i in range(shuffled.size(0)):
+                    n_real = int(src_mask[i].sum().item())
+                    if n_real > 1:
+                        perm = torch.randperm(n_real, device=shuffled.device)
+                        shuffled[i, :n_real] = src_ids[i, :n_real][perm]
+                src_ids = shuffled
             gen_ids = model.generate(
-                source_input_ids=batch["source_ids"],
+                source_input_ids=src_ids,
                 source_attention_mask=batch["source_attention_mask"],
                 prompt_ids=batch["prompt_ids"],
                 prompt_mask=prompt_mask,
@@ -350,6 +566,31 @@ def generate_answers(
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
             )
+        elif mode == "baseline_llm_full":
+            fp_ids = batch["full_prompt_ids"]
+            fp_mask = batch["full_prompt_mask"]
+            prompt_embs = model.decoder.get_input_embeddings()(fp_ids)
+            gen_ids = model.decoder.generate(
+                inputs_embeds=prompt_embs,
+                attention_mask=fp_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        elif mode == "sft":
+            fp_ids = batch["full_prompt_ids"]
+            fp_mask = batch["full_prompt_mask"]
+            gen_ids = sft_decoder.generate(
+                input_ids=fp_ids,
+                attention_mask=fp_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            # generate() returns the prompt + new tokens; trim the prompt.
+            gen_ids = gen_ids[:, fp_ids.size(1):]
         elif mode == "baseline_proj":
             assert proj is not None
             pooled, vision_mask = _encode_source_for_baseline(
@@ -536,20 +777,43 @@ def main() -> None:
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
 
-    print(f"Loading model ({model_args.model_name_or_path})...")
-    model = CVLM(model_args, training_args)
-    model.to(device)
+    sft_decoder: Optional[nn.Module] = None
+    sft_tokenizer = None
+    model: Optional[CVLM] = None
 
-    if args.checkpoint_path:
-        print(f"Loading checkpoint: {args.checkpoint_path}")
-        state_dict = load_file(args.checkpoint_path)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
+    if args.mode == "sft":
+        if not args.sft_model_path:
+            raise ValueError("--mode sft requires --sft_model_path <hf_dir>")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        print(f"Loading SFT model from {args.sft_model_path}")
+        sft_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        sft_decoder = AutoModelForCausalLM.from_pretrained(
+            args.sft_model_path, torch_dtype=sft_dtype
+        ).to(device)
+        sft_decoder.eval()
+        sft_tokenizer = AutoTokenizer.from_pretrained(args.sft_model_path, use_fast=False)
+        if sft_tokenizer.pad_token is None:
+            sft_tokenizer.pad_token = sft_tokenizer.eos_token
+        # Ensure model_args.model_name_or_path is set to the SFT dir so the
+        # CvlmTrainDataset uses the matching decoder tokenizer for filtering
+        # (encoder tokenizer still comes from text_encoder_name).
+        model_args.model_name_or_path = args.sft_model_path
+    else:
+        print(f"Loading model ({model_args.model_name_or_path})...")
+        model = CVLM(model_args, training_args)
+        model.to(device)
 
-    model.eval()
+        if args.checkpoint_path:
+            print(f"Loading checkpoint: {args.checkpoint_path}")
+            state_dict = load_file(args.checkpoint_path)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
+
+        model.eval()
 
     proj: Optional[nn.Linear] = None
     if args.mode == "baseline_proj":
+        assert model is not None
         embed_dim = model.text_encoder.config.hidden_size
         llm_dim = model.decoder.config.hidden_size
         dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -557,8 +821,20 @@ def main() -> None:
         proj.eval()
         print(f"baseline_proj: Linear({embed_dim} → {llm_dim}), random init")
 
-    dec_pad = model.tokenizer.pad_token_id
-    enc_pad = model.encoder_tokenizer.pad_token_id
+    # Pad ids: in SFT mode there's no CVLM wrapper, so look them up directly.
+    if args.mode == "sft":
+        from transformers import AutoTokenizer as _AutoTok
+        enc_tok_for_pad = _AutoTok.from_pretrained(
+            model_args.text_encoder_name, use_fast=True, trust_remote_code=True
+        )
+        if enc_tok_for_pad.pad_token is None:
+            enc_tok_for_pad.pad_token = enc_tok_for_pad.eos_token or enc_tok_for_pad.cls_token
+        dec_pad = sft_tokenizer.pad_token_id
+        enc_pad = enc_tok_for_pad.pad_token_id
+    else:
+        assert model is not None
+        dec_pad = model.tokenizer.pad_token_id
+        enc_pad = model.encoder_tokenizer.pad_token_id
     if dec_pad is None or enc_pad is None:
         raise ValueError("Both decoder and encoder tokenizers must define pad_token")
     collate = make_collate_fn(dec_pad_id=dec_pad, enc_pad_id=enc_pad)
@@ -585,12 +861,25 @@ def main() -> None:
 
     print(f"\n=== Teacher-forcing evaluation (mode={args.mode}) ===")
     if args.mode == "cvlm":
+        assert model is not None
         tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
+    elif args.mode == "cvlm_shuffle":
+        assert model is not None
+        tf_metrics = eval_teacher_forcing_cvlm(
+            model, loader, device, args.max_samples, shuffle_source=True
+        )
     elif args.mode == "baseline_llm":
+        assert model is not None
         tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
+    elif args.mode == "baseline_llm_full":
+        assert model is not None
+        tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples)
     elif args.mode == "baseline_proj":
-        assert proj is not None
+        assert model is not None and proj is not None
         tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
+    elif args.mode == "sft":
+        assert sft_decoder is not None
+        tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
@@ -604,9 +893,10 @@ def main() -> None:
           f"{tf_metrics.get('decoder_input_len_max', 0)}")
 
     print("\n=== Compression stats ===")
+    decoder_tok_for_stats = sft_tokenizer if args.mode == "sft" else model.tokenizer  # type: ignore[union-attr]
     comp_stats = compute_compression_stats(
         dataset,
-        model.tokenizer,
+        decoder_tok_for_stats,
         compression_rate=args.compression_rate,
         max_vision_len=args.max_vision_len,
         max_samples=args.max_samples,
@@ -624,22 +914,39 @@ def main() -> None:
     total_nll = float(tf_metrics.get("total_answer_nll_nats", 0.0))
     total_src = int(comp_stats.get("source_tokens_sum", 0))
     bps = bits_per_source_token(total_nll, total_src)
-    mean_p = float(tf_metrics.get("prompt_len_mean_seen", 0.0)) if args.mode == "cvlm" else 0.0
-    mean_v = float(tf_metrics.get("vision_len_mean_seen", 0.0)) if args.mode == "cvlm" else 0.0
-    eff_reduction = (
-        comp_stats["source_tokens_mean"] / (mean_v + mean_p)
-        if (mean_v + mean_p) > 0 else 0.0
-    )
+    # effective_context_reduction = source_tokens_mean / (decoder tokens actually
+    # consumed besides the answer). >1 means CVLM uses fewer decoder tokens than
+    # the full-text baseline would; ==1 is breakeven; <1 is augmentation.
+    if args.mode in ("cvlm", "cvlm_shuffle"):
+        mean_p = float(tf_metrics.get("prompt_len_mean_seen", 0.0))
+        mean_v = float(tf_metrics.get("vision_len_mean_seen", 0.0))
+        denom = mean_v + mean_p
+    elif args.mode in ("baseline_llm_full", "sft"):
+        denom = float(tf_metrics.get("full_prompt_len_mean_seen", 0.0))
+    elif args.mode == "baseline_llm":
+        # question-only; "context" for document tokens is effectively zero, so
+        # the ratio is undefined — leave as 0 for clarity in the JSON.
+        denom = 0.0
+    else:
+        denom = 0.0
+    eff_reduction = comp_stats["source_tokens_mean"] / denom if denom > 0 else 0.0
     print(f"\n  bits_per_source_token       : {bps:.6f}")
-    if args.mode == "cvlm":
-        print(f"  effective_context_reduction : {eff_reduction:.4f}  "
-              f"(source_tokens_mean / (V_mean + P_mean))")
+    print(f"  effective_context_reduction : {eff_reduction:.4f}  "
+          f"(source_tokens_mean / context_tokens_used)")
 
     gen_metrics: Dict[str, float] = {}
     if args.compute_generation_metrics:
         print(f"\n=== Generation evaluation (mode={args.mode}) ===")
         preds, refs = generate_answers(
-            model, loader, device, args.max_new_tokens, args.max_samples, args.mode, proj
+            model,
+            loader,
+            device,
+            args.max_new_tokens,
+            args.max_samples,
+            args.mode,
+            proj=proj,
+            sft_decoder=sft_decoder,
+            sft_tokenizer=sft_tokenizer,
         )
         gen_metrics = compute_generation_metrics(preds, refs)
         print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
@@ -671,10 +978,11 @@ def main() -> None:
         limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
         cr = max(int(args.compression_rate), 1)
         enc_tok = dataset._enc_tok
+        dec_tok_hist = sft_tokenizer if args.mode == "sft" else model.tokenizer  # type: ignore[union-attr]
         for idx in range(limit):
             row_id = dataset._row_indices[idx]
             text = dataset._hf[row_id]["input"]
-            s_len = len(model.tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"])
+            s_len = len(dec_tok_hist(text, add_special_tokens=False, truncation=False)["input_ids"])
             l_enc = min(len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]),
                         dataset.max_source_len)
             v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)

@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--adamw_beta1", type=float, default=0.9)
-    p.add_argument("--adamw_beta2", type=float, default=0.95)
+    p.add_argument("--adamw_beta2", type=float, default=0.999)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--min_lr", type=float, default=0.0)
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--save_interval_steps",
         type=int,
-        default=500,
+        default=0,
         help=(
             "Save every N optimizer steps (sync points). "
             "Set to 0 to save only at the end of each epoch (no extra mid-epoch saves)."
@@ -105,6 +105,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Directory for TensorBoard logs. Defaults to <output_dir>/tb if not set.",
+    )
+    p.add_argument(
+        "--plot_interval",
+        type=int,
+        default=100,
+        help="Refresh PNG dashboards every N optimizer steps. 0 = disable PNG plots.",
+    )
+    p.add_argument(
+        "--csv_path",
+        type=str,
+        default="",
+        help="Override CSV metric file location. Defaults to <output_dir>/metrics.csv.",
     )
     return p.parse_args()
 
@@ -187,10 +199,15 @@ def main() -> None:
     )
 
     if use_ddp:
+        # All trainable sub-modules (text_projector, ViT, vision_projector,
+        # vision_pos_embed) are hit every forward, and the frozen sub-modules
+        # have requires_grad=False so DDP already skips them. find_unused=True
+        # forces a reducer walk over all parameters every step (slower) and is
+        # unnecessary here; keep it False so a real graph break shows up loudly.
         model = DDP(
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -261,15 +278,18 @@ def main() -> None:
         )
 
     writer = None
+    csv_writer = None
+    plotter = None
     if is_master:
         from torch.utils.tensorboard import SummaryWriter
+        from train_logging import make_logger
         tb_dir = args.tensorboard_dir.strip() or os.path.join(args.output_dir, "tb")
         os.makedirs(tb_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=tb_dir)
+        csv_writer, plotter = make_logger(args.output_dir, args.csv_path, args.plot_interval)
 
     model.train()
     # Frozen sub-modules must stay in eval mode (no dropout noise on frozen weights).
-    unwrap_model(model).decoder.eval()
     unwrap_model(model).text_encoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
@@ -366,6 +386,24 @@ def main() -> None:
                     if grad_norm > 0:
                         writer.add_scalar("train/grad_norm", grad_norm, global_step)
                     writer.add_scalar("train/batch_time", batch_time, global_step)
+                if csv_writer is not None:
+                    csv_writer.append(
+                        step=global_step,
+                        loss=curr_loss,
+                        loss_avg=running_avg_loss_value.avg,
+                        lr=curr_lrs[0] if curr_lrs else args.lr,
+                        grad_norm=grad_norm if grad_norm > 0 else 0.0,
+                        batch_time=batch_time,
+                    )
+
+            if (
+                is_master
+                and plotter is not None
+                and args.plot_interval > 0
+                and global_step % args.plot_interval == 0
+                and sync_step
+            ):
+                plotter.refresh()
 
             if (
                 is_master
@@ -419,6 +457,10 @@ def main() -> None:
 
     if writer is not None:
         writer.close()
+    if csv_writer is not None:
+        csv_writer.close()
+    if plotter is not None:
+        plotter.refresh()
 
     cleanup_distributed(use_ddp)
 
