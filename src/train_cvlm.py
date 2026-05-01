@@ -104,7 +104,11 @@ def parse_args() -> argparse.Namespace:
         "--tensorboard_dir",
         type=str,
         default="",
-        help="Directory for TensorBoard logs. Defaults to <output_dir>/tb if not set.",
+        help=(
+            "[DEPRECATED] TensorBoard has been replaced by trackio; this flag is "
+            "accepted for backward compatibility with launch scripts but is no "
+            "longer wired to anything. Use --trackio_project / --trackio_run_name."
+        ),
     )
     p.add_argument(
         "--plot_interval",
