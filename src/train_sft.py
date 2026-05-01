@@ -389,6 +389,10 @@ def main() -> None:
         "lr": args.lr,
         "max_prompt_len": args.max_prompt_len,
         "max_answer_len": args.max_answer_len,
+        "seed": args.seed,
+        "bf16": use_bf16,
+        "warmup_steps": args.warmup_steps if args.enable_warmup else 0,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
         "task": "sft_baseline",
     }
 
