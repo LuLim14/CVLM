@@ -64,6 +64,13 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-${BATCH_SIZE}}"
 EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm baseline_llm_full baseline_proj}"
 EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation metrics
 
+# trackio (replaces TensorBoard for the live UI)
+TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
+TRACKIO_RUN_NAME="${TRACKIO_RUN_NAME:-$(basename "${OUTPUT_DIR}")}"
+TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID:-}"
+TRACKIO_DISABLE="${TRACKIO_DISABLE:-0}"
+export TRACKIO_PROJECT TRACKIO_RUN_NAME TRACKIO_SPACE_ID TRACKIO_DISABLE
+
 TB_DIR="${OUTPUT_DIR}/tb"
 LOG_FILE="${OUTPUT_DIR}/pipeline.log"
 
@@ -87,8 +94,13 @@ echo "  EVAL_MODES        = ${EVAL_MODES}"
 echo "  EVAL_COMPUTE_GEN  = ${EVAL_COMPUTE_GEN}"
 echo "  TB_DIR            = ${TB_DIR}"
 echo "  LOG_FILE          = ${LOG_FILE}"
+echo "  TRACKIO_PROJECT   = ${TRACKIO_PROJECT}"
+echo "  TRACKIO_RUN_NAME  = ${TRACKIO_RUN_NAME}"
+echo "  TRACKIO_SPACE_ID  = ${TRACKIO_SPACE_ID:-<local-only>}"
+echo "  TRACKIO_DISABLE   = ${TRACKIO_DISABLE}"
 echo "======================================================================"
-echo "TensorBoard:  tensorboard --logdir ${TB_DIR} --port 6006 --bind_all"
+echo "trackio UI:   trackio show --project ${TRACKIO_PROJECT}"
+echo "(or set TRACKIO_SPACE_ID=user/space to host on HF Spaces)"
 echo "======================================================================"
 
 # -----------------------------------------------------------------------------
@@ -177,5 +189,5 @@ echo "DONE. Artifacts:"
 echo "  checkpoints : ${OUTPUT_DIR}/model_step_*.safetensors"
 echo "  eval JSON   : ${OUTPUT_DIR}/eval_*.json"
 echo "  full log    : ${LOG_FILE}"
-echo "  tensorboard : tensorboard --logdir ${TB_DIR} --port 6006 --bind_all"
+echo "  trackio UI  : trackio show --project ${TRACKIO_PROJECT}"
 echo "======================================================================"
