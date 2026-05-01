@@ -20,6 +20,10 @@ export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 # `libtorch_cuda.so: undefined symbol: ncclDevCommDestroy` from a user-site
 # torch built against a newer NCCL than the system's).
 export PYTHONNOUSERSITE=1
+# Flush print() to tee/pipeline.log immediately instead of waiting for the
+# 8KB block-buffer to fill — surfaces master-rank prints + any TrackioRun
+# warnings in real time.
+export PYTHONUNBUFFERED=1
 
 # -----------------------------------------------------------------------------
 # Configuration (override by exporting env vars before running).
@@ -60,9 +64,16 @@ COMPRESSION_RATE="${COMPRESSION_RATE:-4}"
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
 TRACKIO_RUN_NAME="${TRACKIO_RUN_NAME:-$(basename "${OUTPUT_DIR}")}"
-TRACKIO_SPACE_ID="${TRACKIO_SPACE_ID:-}"
 TRACKIO_DISABLE="${TRACKIO_DISABLE:-0}"
-export TRACKIO_PROJECT TRACKIO_RUN_NAME TRACKIO_SPACE_ID TRACKIO_DISABLE
+export TRACKIO_PROJECT TRACKIO_RUN_NAME TRACKIO_DISABLE
+# Only export TRACKIO_SPACE_ID when set non-empty: trackio reads the env var
+# directly and treats an empty string as "<user>/" which fails repo-id
+# validation.
+if [[ -n "${TRACKIO_SPACE_ID:-}" ]]; then
+  export TRACKIO_SPACE_ID
+else
+  unset TRACKIO_SPACE_ID
+fi
 
 TB_DIR="${OUTPUT_DIR}/tb"
 LOG_FILE="${OUTPUT_DIR}/pipeline.log"
