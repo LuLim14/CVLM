@@ -118,6 +118,30 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Override CSV metric file location. Defaults to <output_dir>/metrics.csv.",
     )
+    p.add_argument(
+        "--trackio_project",
+        type=str,
+        default=os.environ.get("TRACKIO_PROJECT", "cvlm"),
+        help="trackio project name. Default: cvlm or $TRACKIO_PROJECT.",
+    )
+    p.add_argument(
+        "--trackio_run_name",
+        type=str,
+        default=os.environ.get("TRACKIO_RUN_NAME", ""),
+        help="trackio run name. Default: basename(output_dir) or $TRACKIO_RUN_NAME.",
+    )
+    p.add_argument(
+        "--trackio_space_id",
+        type=str,
+        default=os.environ.get("TRACKIO_SPACE_ID", ""),
+        help="Optional HF Space id (user/space) to host the dashboard.",
+    )
+    p.add_argument(
+        "--trackio_disable",
+        action="store_true",
+        default=os.environ.get("TRACKIO_DISABLE", "0") == "1",
+        help="Disable trackio logging (CSV/PNG still run).",
+    )
     return p.parse_args()
 
 
@@ -277,15 +301,33 @@ def main() -> None:
             f"  grad_clip: {grad_clip}\n"
         )
 
-    writer = None
+    trackio_run = None
     csv_writer = None
     plotter = None
     if is_master:
-        from torch.utils.tensorboard import SummaryWriter
-        from train_logging import make_logger
-        tb_dir = args.tensorboard_dir.strip() or os.path.join(args.output_dir, "tb")
-        os.makedirs(tb_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=tb_dir)
+        from train_logging import TrackioRun, make_logger
+        run_name = args.trackio_run_name.strip() or os.path.basename(args.output_dir.rstrip("/"))
+        config_payload = {
+            "model_name_or_path": model_args.model_name_or_path,
+            "text_encoder_name": model_args.text_encoder_name,
+            "vision_encoder_name": getattr(model_args, "vision_encoder_name", ""),
+            "compression_rate": args.compression_rate,
+            "max_vision_len": args.max_vision_len,
+            "max_source_len": args.max_source_len,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "grad_accum": args.gradient_accumulation_steps,
+            "lr": args.lr,
+            "warmup_steps": warmup_steps,
+            "world_size": world_size,
+        }
+        trackio_run = TrackioRun(
+            project=args.trackio_project,
+            name=run_name,
+            config=config_payload,
+            space_id=args.trackio_space_id or None,
+            disable=args.trackio_disable,
+        )
         csv_writer, plotter = make_logger(args.output_dir, args.csv_path, args.plot_interval)
 
     model.train()
@@ -379,13 +421,16 @@ def main() -> None:
                     gn,
                     f"data: {data_time:>7.5f}s batch: {batch_time:>6.3f}s",
                 )
-                if writer is not None:
-                    writer.add_scalar("train/loss", curr_loss, global_step)
-                    writer.add_scalar("train/loss_avg", running_avg_loss_value.avg, global_step)
-                    writer.add_scalar("train/lr", curr_lrs[0] if curr_lrs else args.lr, global_step)
+                if trackio_run is not None:
+                    metrics = {
+                        "train/loss": curr_loss,
+                        "train/loss_avg": running_avg_loss_value.avg,
+                        "train/lr": curr_lrs[0] if curr_lrs else args.lr,
+                        "train/batch_time": batch_time,
+                    }
                     if grad_norm > 0:
-                        writer.add_scalar("train/grad_norm", grad_norm, global_step)
-                    writer.add_scalar("train/batch_time", batch_time, global_step)
+                        metrics["train/grad_norm"] = grad_norm
+                    trackio_run.log(metrics, step=global_step)
                 if csv_writer is not None:
                     csv_writer.append(
                         step=global_step,
@@ -455,8 +500,8 @@ def main() -> None:
     if is_master:
         print("Training finished.")
 
-    if writer is not None:
-        writer.close()
+    if trackio_run is not None:
+        trackio_run.finish()
     if csv_writer is not None:
         csv_writer.close()
     if plotter is not None:
