@@ -63,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_json", type=str, default="")
     p.add_argument("--tensorboard_dir", type=str, default="")
     p.add_argument("--tb_run_name", type=str, default="")
+    p.add_argument("--trackio_project", type=str,
+                   default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
+    p.add_argument("--trackio_run_name", type=str,
+                   default=os.environ.get("TRACKIO_RUN_NAME", ""))
+    p.add_argument("--trackio_space_id", type=str,
+                   default=os.environ.get("TRACKIO_SPACE_ID", ""))
+    p.add_argument("--trackio_disable", action="store_true",
+                   default=os.environ.get("TRACKIO_DISABLE", "0") == "1")
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -963,17 +971,40 @@ def main() -> None:
         "effective_context_reduction": eff_reduction,
     }
 
-    if args.tensorboard_dir:
-        from torch.utils.tensorboard import SummaryWriter
-        run_name = args.tb_run_name or f"eval_{args.mode}"
-        tb_path = os.path.join(args.tensorboard_dir, run_name)
-        os.makedirs(tb_path, exist_ok=True)
-        writer = SummaryWriter(log_dir=tb_path)
+    if not args.trackio_disable:
+        from train_logging import TrackioRun
+        run_name = (
+            args.trackio_run_name.strip()
+            or args.tb_run_name
+            or f"eval_{args.mode}"
+        )
+        eval_config = {
+            "mode": args.mode,
+            "model_name_or_path": args.model_name_or_path,
+            "text_encoder_name": args.text_encoder_name,
+            "compression_rate": args.compression_rate,
+            "max_prompt_len": args.max_prompt_len,
+            "max_answer_len": args.max_answer_len,
+            "max_vision_len": args.max_vision_len,
+            "max_source_len": args.max_source_len,
+            "checkpoint_path": getattr(args, "checkpoint_path", "") or getattr(args, "sft_model_path", ""),
+            "global_step": int(args.global_step),
+        }
+        run = TrackioRun(
+            project=args.trackio_project,
+            name=run_name,
+            config=eval_config,
+            space_id=args.trackio_space_id or None,
+        )
         step = int(args.global_step)
+
+        flat_metrics: dict = {}
         for k, v in results.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                writer.add_scalar(f"eval/{k}", float(v), step)
-        # Histogram of per-sample compression ratios from comp_stats data.
+                flat_metrics[f"eval/{k}"] = float(v)
+        if flat_metrics:
+            run.log(flat_metrics, step=step)
+
         per_sample_ratios = []
         limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
         cr = max(int(args.compression_rate), 1)
@@ -988,9 +1019,9 @@ def main() -> None:
             v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)
             per_sample_ratios.append(s_len / v_len)
         if per_sample_ratios:
-            writer.add_histogram("eval/compression_ratio_dist", np.asarray(per_sample_ratios), step)
-        writer.close()
-        print(f"\nEval metrics logged to TensorBoard at {tb_path} (step={step})")
+            run.log_histogram("eval/compression_ratio_dist", per_sample_ratios, step=step)
+        run.finish()
+        print(f"\nEval metrics logged to trackio (project={args.trackio_project} run={run_name} step={step})")
 
     if args.output_json:
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
