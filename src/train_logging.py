@@ -228,7 +228,7 @@ class TrackioRun:
         if not self.enabled:
             return
         try:
-            self._mod.log(metrics, step=step)
+            self._mod.log(metrics, step=step)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
             print(f"[train_logging] trackio.log failed (disabling): {exc}")
             self.enabled = False
@@ -256,7 +256,7 @@ class TrackioRun:
                     payload[f"{key}_min"] = float(arr.min())
                     payload[f"{key}_max"] = float(arr.max())
             if payload:
-                self._mod.log(payload, step=step)
+                self._mod.log(payload, step=step)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
             print(f"[train_logging] trackio histogram log failed (disabling): {exc}")
             self.enabled = False
@@ -265,7 +265,7 @@ class TrackioRun:
         if not self.enabled:
             return
         try:
-            self._mod.finish()
+            self._mod.finish()  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
             print(f"[train_logging] trackio.finish failed: {exc}")
         self.enabled = False

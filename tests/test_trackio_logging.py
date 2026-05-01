@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from train_logging import TrackioRun
+from train_logging import TrackioRun  # type: ignore[import-not-found]
 
 
 class _Stub:
@@ -26,9 +26,9 @@ class _Stub:
 def stub_trackio(monkeypatch):
     stub = _Stub()
     fake = types.ModuleType("trackio")
-    fake.init = stub.init
-    fake.log = stub.log
-    fake.finish = stub.finish
+    fake.init = stub.init  # type: ignore[attr-defined]
+    fake.log = stub.log  # type: ignore[attr-defined]
+    fake.finish = stub.finish  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "trackio", fake)
     return stub
 
