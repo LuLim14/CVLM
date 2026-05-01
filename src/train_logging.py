@@ -189,9 +189,13 @@ class MetricsPngPlotter:
 class TrackioRun:
     """Thin wrapper around the trackio SDK with a no-op fallback.
 
-    The trainer never branches on `enabled`; calling .log/.log_histogram/.finish
-    on a disabled run is a no-op. trackio is imported lazily so the rest of the
-    pipeline still runs if the package isn't installed.
+    `self._mod` is the single source of truth for "logger live": None means
+    every public method is a no-op. The trainer never has to branch — it can
+    blindly call .log / .log_histogram / .finish.
+
+    All SDK calls below are wrapped in `except Exception` because telemetry
+    must not crash training; on any failure we drop `_mod` and downgrade to a
+    no-op for the rest of the run.
     """
 
     def __init__(
@@ -202,14 +206,13 @@ class TrackioRun:
         space_id: Optional[str] = None,
         disable: bool = False,
     ) -> None:
-        self.enabled = False
         self._mod = None
         if disable:
             return
         try:
             import trackio as _tr  # type: ignore
         except Exception as exc:  # noqa: BLE001
-            print(f"[train_logging] trackio not available; logging disabled: {exc}")
+            print(f"[train_logging.trackio] not available; logging disabled: {exc}")
             return
         if _tr is None:  # monkeypatched-to-None in tests
             return
@@ -219,56 +222,64 @@ class TrackioRun:
                 init_kwargs["space_id"] = space_id
             _tr.init(**init_kwargs)
         except Exception as exc:  # noqa: BLE001
-            print(f"[train_logging] trackio.init failed; logging disabled: {exc}")
+            print(f"[train_logging.trackio] init failed; logging disabled: {exc}")
             return
         self._mod = _tr
-        self.enabled = True
+
+    @property
+    def enabled(self) -> bool:
+        return self._mod is not None
 
     def log(self, metrics: dict, step: Optional[int] = None) -> None:
-        if not self.enabled:
+        mod = self._mod
+        if mod is None:
             return
         try:
-            self._mod.log(metrics, step=step)  # type: ignore[union-attr]
+            mod.log(metrics, step=step)
         except Exception as exc:  # noqa: BLE001
-            print(f"[train_logging] trackio.log failed (disabling): {exc}")
-            self.enabled = False
+            print(f"[train_logging.trackio] log failed (disabling): {exc}")
+            self._mod = None
 
     def log_histogram(self, key: str, values, step: Optional[int] = None) -> None:
         """Best-effort histogram log. trackio's histogram object varies by
-        version; if unavailable we log summary statistics under <key>_mean/std.
+        version; if unavailable we log summary statistics under
+        <key>_mean/std/min/max.
         """
-        if not self.enabled:
+        mod = self._mod
+        if mod is None:
             return
         try:
             import numpy as np
             arr = np.asarray(values, dtype=float).ravel()
+            if arr.size == 0:
+                return
             payload: dict = {}
-            try:
-                Hist = getattr(self._mod, "Histogram", None)
-                if Hist is not None:
+            Hist = getattr(mod, "Histogram", None)
+            if Hist is not None:
+                try:
                     payload[key] = Hist(arr.tolist())
-                else:
-                    raise AttributeError
-            except Exception:
-                if arr.size:
-                    payload[f"{key}_mean"] = float(arr.mean())
-                    payload[f"{key}_std"] = float(arr.std())
-                    payload[f"{key}_min"] = float(arr.min())
-                    payload[f"{key}_max"] = float(arr.max())
-            if payload:
-                self._mod.log(payload, step=step)  # type: ignore[union-attr]
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[train_logging.trackio] Histogram() failed; falling back to stats: {exc}")
+                    Hist = None
+            if Hist is None:
+                payload[f"{key}_mean"] = float(arr.mean())
+                payload[f"{key}_std"] = float(arr.std())
+                payload[f"{key}_min"] = float(arr.min())
+                payload[f"{key}_max"] = float(arr.max())
+            mod.log(payload, step=step)
         except Exception as exc:  # noqa: BLE001
-            print(f"[train_logging] trackio histogram log failed (disabling): {exc}")
-            self.enabled = False
+            print(f"[train_logging.trackio] histogram log failed (disabling): {exc}")
+            self._mod = None
 
     def finish(self) -> None:
-        if not self.enabled:
+        mod = self._mod
+        if mod is None:
             return
+        self._mod = None
         try:
-            self._mod.finish()  # type: ignore[union-attr]
+            mod.finish()
         except Exception as exc:  # noqa: BLE001
-            print(f"[train_logging] trackio.finish failed: {exc}")
-        self.enabled = False
+            print(f"[train_logging.trackio] finish failed: {exc}")
 
 
 def make_logger(
