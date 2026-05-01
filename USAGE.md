@@ -109,3 +109,69 @@ ignores the encoder/vision side.
 | `ENABLE_WARMUP` / `WARMUP_STEPS` | 1 / 100 | linear LR warmup |
 | `EVAL_SPLIT` | `test` | split to evaluate on |
 | `SKIP_TRAIN` | 0 | set to 1 to skip training and re-eval an existing dir |
+
+## Trackio logging
+
+`SummaryWriter` has been replaced by [trackio](https://github.com/gradio-app/trackio)
+for the live dashboard. CSV (`metrics.csv`) and PNG (`dashboard.png`) outputs are
+unchanged and continue to work even when trackio is disabled.
+
+### Install
+
+```bash
+pip install trackio
+```
+
+### Run a training with trackio
+
+```bash
+TRACKIO_PROJECT=cvlm \
+TRACKIO_RUN_NAME=my-run \
+OUTPUT_DIR=/path/to/run \
+bash CVLM/scripts/run_full_pipeline.sh
+```
+
+Defaults: `TRACKIO_PROJECT=cvlm`, `TRACKIO_RUN_NAME=$(basename "$OUTPUT_DIR")`.
+The same env vars are honoured by `scripts/run_sft_pipeline.sh`.
+
+Per-binary CLI flags (equivalent to env vars) are available on
+`train_cvlm.py`, `train_sft.py`, and `eval_cvlm.py`:
+
+```
+--trackio_project NAME      # default: cvlm
+--trackio_run_name NAME     # default: output dir basename
+--trackio_space_id user/repo  # optional HF Space to host the dashboard
+--trackio_disable           # turn trackio off entirely
+```
+
+### View the dashboard
+
+Local UI:
+
+```bash
+trackio show --project cvlm
+```
+
+Host on HF Spaces (auto-creates the Space the first time):
+
+```bash
+TRACKIO_SPACE_ID=username/cvlm-runs bash CVLM/scripts/run_full_pipeline.sh
+```
+
+### Disable trackio
+
+```bash
+TRACKIO_DISABLE=1 bash CVLM/scripts/run_full_pipeline.sh
+# or per-binary:
+python CVLM/src/train_cvlm.py --trackio_disable ...
+```
+
+CSV + PNG outputs remain available when trackio is disabled.
+
+### Metrics keys
+
+| Phase | Keys |
+| --- | --- |
+| Train (CVLM) | `train/loss`, `train/loss_avg`, `train/lr`, `train/grad_norm`, `train/batch_time` |
+| Train (SFT) | `train/loss`, `train/lr`, `train/grad_norm`, `train/epoch` |
+| Eval | `eval/<metric>` (loss, ppl, ROUGE, BLEU-4, EM, compression stats) + `eval/compression_ratio_dist` (histogram if supported, else `*_mean/std/min/max`) |
