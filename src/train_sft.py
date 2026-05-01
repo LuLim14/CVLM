@@ -224,6 +224,60 @@ class PngLoggingCallback(TrainerCallback):
             self._csv.close()
 
 
+class TrackioCallback(TrainerCallback):
+    """Forwards `Trainer.log` metrics to a `TrackioRun` on master rank only."""
+
+    def __init__(
+        self,
+        project: str,
+        name: str,
+        config: Dict[str, Any],
+        space_id: Optional[str] = None,
+        disable: bool = False,
+    ) -> None:
+        self.project = project
+        self.name = name
+        self.config = config
+        self.space_id = space_id or None
+        self.disable = disable
+        self._run = None  # constructed on_train_begin (master only)
+
+    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):  # type: ignore[override]
+        if not state.is_world_process_zero:
+            return
+        from train_logging import TrackioRun
+        self._run = TrackioRun(
+            project=self.project,
+            name=self.name,
+            config=self.config,
+            space_id=self.space_id,
+            disable=self.disable,
+        )
+
+    def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):  # type: ignore[override]
+        if self._run is None or logs is None:
+            return
+        # Skip eval-only logs (no "loss" key) — same filter as PngLoggingCallback.
+        if "loss" not in logs:
+            return
+        metrics: Dict[str, float] = {}
+        for src_key, dst_key in (
+            ("loss", "train/loss"),
+            ("learning_rate", "train/lr"),
+            ("grad_norm", "train/grad_norm"),
+            ("epoch", "train/epoch"),
+        ):
+            if src_key in logs and isinstance(logs[src_key], (int, float)):
+                metrics[dst_key] = float(logs[src_key])
+        if metrics:
+            self._run.log(metrics, step=int(state.global_step))
+
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):  # type: ignore[override]
+        if self._run is not None:
+            self._run.finish()
+            self._run = None
+
+
 # -----------------------------------------------------------------------------
 # CLI + main
 # -----------------------------------------------------------------------------
@@ -255,6 +309,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--csv_path", type=str, default="")
     p.add_argument("--tensorboard_dir", type=str, default="",
                    help="Defaults to <output_dir>/tb if not set.")
+    p.add_argument("--trackio_project", type=str,
+                   default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
+    p.add_argument("--trackio_run_name", type=str,
+                   default=os.environ.get("TRACKIO_RUN_NAME", ""))
+    p.add_argument("--trackio_space_id", type=str,
+                   default=os.environ.get("TRACKIO_SPACE_ID", ""))
+    p.add_argument("--trackio_disable", action="store_true",
+                   default=os.environ.get("TRACKIO_DISABLE", "0") == "1")
     return p.parse_args()
 
 
@@ -307,7 +369,7 @@ def main() -> None:
         logging_strategy="steps",
         logging_steps=args.log_interval,
         logging_dir=tb_dir,
-        report_to=["tensorboard"],
+        report_to=[],
         seed=args.seed,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
@@ -318,13 +380,34 @@ def main() -> None:
 
     csv_path = args.csv_path.strip() or os.path.join(args.output_dir, "metrics.csv")
 
+    sft_run_name = args.trackio_run_name.strip() or os.path.basename(args.output_dir.rstrip("/"))
+    sft_config = {
+        "model_name_or_path": args.model_name_or_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_accum": args.gradient_accumulation_steps,
+        "lr": args.lr,
+        "max_prompt_len": args.max_prompt_len,
+        "max_answer_len": args.max_answer_len,
+        "task": "sft_baseline",
+    }
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         data_collator=collator,
         tokenizer=tokenizer,
-        callbacks=[PngLoggingCallback(args.output_dir, csv_path, args.plot_interval)],
+        callbacks=[
+            PngLoggingCallback(args.output_dir, csv_path, args.plot_interval),
+            TrackioCallback(
+                project=args.trackio_project,
+                name=sft_run_name,
+                config=sft_config,
+                space_id=args.trackio_space_id,
+                disable=args.trackio_disable,
+            ),
+        ],
     )
 
     print(f"[train_sft] Starting training: epochs={args.epochs} bs={args.batch_size} "
