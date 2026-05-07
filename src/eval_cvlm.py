@@ -8,16 +8,18 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
+import re
 from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from cvlm_dataset import CvlmTrainDataset, make_collate_fn
-from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_mean_pool
+from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_attention_pool
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -71,6 +73,15 @@ def parse_args() -> argparse.Namespace:
                    default=os.environ.get("TRACKIO_SPACE_ID", ""))
     p.add_argument("--trackio_disable", action="store_true",
                    default=os.environ.get("TRACKIO_DISABLE", "0") == "1")
+    p.add_argument("--all_checkpoints", action="store_true",
+                   default=os.environ.get("EVAL_ALL_CHECKPOINTS", "0") == "1",
+                   help="Iterate over all model_step_*.safetensors in the checkpoint directory "
+                        "and log each at step=<ckpt_step> in a single trackio run.")
+    p.add_argument("--cr_schedule", type=str,
+                   default=os.environ.get("EVAL_CR_SCHEDULE", ""),
+                   help="When combined with --all_checkpoints: evaluate each checkpoint at the "
+                        "compression_rate that was active when it was trained. Schedule format "
+                        "matches train_cvlm.py: 'cr:end_step,...' with last end_step=0 sentinel.")
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -92,14 +103,19 @@ def _move(batch: dict, device: torch.device) -> dict:
 
 
 def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
-    """Run the frozen text_encoder + chunked mean pool. Used by baseline_proj."""
+    """Run the frozen text_encoder + chunked attention pool. Used by baseline_proj.
+
+    Uses the model's trained pool_query so the ablation isolates "ViT vs random
+    linear" rather than mixing in a different pooling rule.
+    """
     with torch.no_grad():
         h = model.text_encoder(input_ids=source_ids, attention_mask=source_mask).last_hidden_state
-    pooled, vmask = _chunked_mean_pool(
+    pooled, vmask = _chunked_attention_pool(
         h.detach(),
         source_mask,
         compression_rate=model.compression_rate,
         max_vision_len=model.max_vision_len,
+        pool_query=model.pool_query,
     )
     return pooled, vmask
 
@@ -768,6 +784,27 @@ def bits_per_source_token(total_answer_nll_nats: float, total_source_tokens: int
 
 def main() -> None:
     args = parse_args()
+    if args.mode == "sft" and args.all_checkpoints:
+        raise ValueError(
+            "--all_checkpoints is incompatible with --mode sft: SFT eval uses "
+            "--sft_model_path (an HF directory) rather than model_step_*.safetensors."
+        )
+
+    # Optional per-checkpoint cr lookup: when --cr_schedule is set, each ckpt
+    # is evaluated at the cr that produced its weights. Requires --all_checkpoints
+    # and a cr-aware mode. Schedule helpers come from train_cvlm.py.
+    cr_schedule = None
+    if args.cr_schedule:
+        if not args.all_checkpoints:
+            raise ValueError("--cr_schedule requires --all_checkpoints")
+        if args.mode not in ("cvlm", "cvlm_shuffle", "baseline_proj"):
+            raise ValueError(
+                f"--cr_schedule only meaningful for cr-dependent modes "
+                f"(cvlm/cvlm_shuffle/baseline_proj); got --mode {args.mode}"
+            )
+        from train_cvlm import _parse_cr_schedule, _training_cr_for_step
+        cr_schedule = _parse_cr_schedule(args.cr_schedule)
+        print(f"\n=== --cr_schedule active: {cr_schedule} ===")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_bf16 = device.type == "cuda" and not args.no_bf16
@@ -811,7 +848,7 @@ def main() -> None:
         model = CVLM(model_args, training_args)
         model.to(device)
 
-        if args.checkpoint_path:
+        if args.checkpoint_path and not args.all_checkpoints:
             print(f"Loading checkpoint: {args.checkpoint_path}")
             state_dict = load_file(args.checkpoint_path)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -867,117 +904,50 @@ def main() -> None:
         drop_last=False,
     )
 
-    print(f"\n=== Teacher-forcing evaluation (mode={args.mode}) ===")
-    if args.mode == "cvlm":
-        assert model is not None
-        tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
-    elif args.mode == "cvlm_shuffle":
-        assert model is not None
-        tf_metrics = eval_teacher_forcing_cvlm(
-            model, loader, device, args.max_samples, shuffle_source=True
-        )
-    elif args.mode == "baseline_llm":
-        assert model is not None
-        tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
-    elif args.mode == "baseline_llm_full":
-        assert model is not None
-        tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples)
-    elif args.mode == "baseline_proj":
-        assert model is not None and proj is not None
-        tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
-    elif args.mode == "sft":
-        assert sft_decoder is not None
-        tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples)
-    else:
-        raise ValueError(f"Unknown mode: {args.mode}")
-
-    tf_metrics["mode"] = args.mode
-    print(f"  Perplexity:      {tf_metrics['perplexity']:.4f}")
-    print(f"  Token Accuracy:  {tf_metrics['token_accuracy']:.4f}")
-    print(f"  Avg Loss:        {tf_metrics['avg_loss']:.4f}")
-    print(f"  Samples:         {tf_metrics['n_samples']}")
-    print(f"  Decoder in-len mean/max: "
-          f"{tf_metrics.get('decoder_input_len_mean', 0):.1f} / "
-          f"{tf_metrics.get('decoder_input_len_max', 0)}")
-
-    print("\n=== Compression stats ===")
+    # Compression stats are weight-independent at fixed cr. With --cr_schedule
+    # the cr varies per checkpoint, so we cache stats keyed by cr and look them
+    # up inside the per-checkpoint loop. Without a schedule, the cache only
+    # ever holds one entry (the static --compression_rate) and we precompute it.
     decoder_tok_for_stats = sft_tokenizer if args.mode == "sft" else model.tokenizer  # type: ignore[union-attr]
-    comp_stats = compute_compression_stats(
-        dataset,
-        decoder_tok_for_stats,
-        compression_rate=args.compression_rate,
-        max_vision_len=args.max_vision_len,
-        max_samples=args.max_samples,
-    )
-    for k in [
-        "source_tokens_mean",
-        "vision_len_mean", "vision_len_median", "vision_len_min", "vision_len_max",
-        "compression_ratio_mean", "compression_ratio_median",
-        "compression_ratio_p10", "compression_ratio_p90",
-        "compression_ratio_min", "compression_ratio_max",
-        "n_compression_samples",
-    ]:
-        print(f"  {k:28s}: {comp_stats[k]}")
+    comp_stats_cache: Dict[int, Dict[str, float]] = {}
 
-    total_nll = float(tf_metrics.get("total_answer_nll_nats", 0.0))
-    total_src = int(comp_stats.get("source_tokens_sum", 0))
-    bps = bits_per_source_token(total_nll, total_src)
-    # effective_context_reduction = source_tokens_mean / (decoder tokens actually
-    # consumed besides the answer). >1 means CVLM uses fewer decoder tokens than
-    # the full-text baseline would; ==1 is breakeven; <1 is augmentation.
-    if args.mode in ("cvlm", "cvlm_shuffle"):
-        mean_p = float(tf_metrics.get("prompt_len_mean_seen", 0.0))
-        mean_v = float(tf_metrics.get("vision_len_mean_seen", 0.0))
-        denom = mean_v + mean_p
-    elif args.mode in ("baseline_llm_full", "sft"):
-        denom = float(tf_metrics.get("full_prompt_len_mean_seen", 0.0))
-    elif args.mode == "baseline_llm":
-        # question-only; "context" for document tokens is effectively zero, so
-        # the ratio is undefined — leave as 0 for clarity in the JSON.
-        denom = 0.0
+    def _get_comp_stats(cr_val: int) -> Dict[str, float]:
+        if cr_val not in comp_stats_cache:
+            print(f"\n=== Compression stats (cr={cr_val}) ===")
+            stats = compute_compression_stats(
+                dataset,
+                decoder_tok_for_stats,
+                compression_rate=cr_val,
+                max_vision_len=args.max_vision_len,
+                max_samples=args.max_samples,
+            )
+            for k in [
+                "source_tokens_mean",
+                "vision_len_mean", "vision_len_median", "vision_len_min", "vision_len_max",
+                "compression_ratio_mean", "compression_ratio_median",
+                "compression_ratio_p10", "compression_ratio_p90",
+                "compression_ratio_min", "compression_ratio_max",
+                "n_compression_samples",
+            ]:
+                print(f"  {k:28s}: {stats[k]}")
+            comp_stats_cache[cr_val] = stats
+        return comp_stats_cache[cr_val]
+
+    if cr_schedule is None:
+        comp_stats = _get_comp_stats(int(args.compression_rate))
     else:
-        denom = 0.0
-    eff_reduction = comp_stats["source_tokens_mean"] / denom if denom > 0 else 0.0
-    print(f"\n  bits_per_source_token       : {bps:.6f}")
-    print(f"  effective_context_reduction : {eff_reduction:.4f}  "
-          f"(source_tokens_mean / context_tokens_used)")
+        comp_stats = None  # populated per-ckpt inside the loop
 
-    gen_metrics: Dict[str, float] = {}
-    if args.compute_generation_metrics:
-        print(f"\n=== Generation evaluation (mode={args.mode}) ===")
-        preds, refs = generate_answers(
-            model,
-            loader,
-            device,
-            args.max_new_tokens,
-            args.max_samples,
-            args.mode,
-            proj=proj,
-            sft_decoder=sft_decoder,
-            sft_tokenizer=sft_tokenizer,
-        )
-        gen_metrics = compute_generation_metrics(preds, refs)
-        print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
-        print(f"  ROUGE-2:       {gen_metrics['rouge2']:.4f}")
-        print(f"  ROUGE-L:       {gen_metrics['rougeL']:.4f}")
-        print(f"  BLEU-4:        {gen_metrics['bleu4']:.2f}")
-        print(f"  Exact Match:   {gen_metrics['exact_match']:.4f}")
-
-    results = {
-        **tf_metrics,
-        **gen_metrics,
-        **comp_stats,
-        "bits_per_source_token": bps,
-        "effective_context_reduction": eff_reduction,
-    }
-
+    # Open the per-mode trackio run ONCE — all checkpoints log into it.
+    run = None
+    run_name = ""
     if not args.trackio_disable:
         from train_logging import TrackioRun
-        run_name = (
-            args.trackio_run_name.strip()
-            or args.tb_run_name
-            or f"eval_{args.mode}"
-        )
+        # Always suffix with _{mode} so each eval mode gets its own trackio
+        # run when sharing a base TRACKIO_RUN_NAME across cvlm/baseline_*.
+        base_run = args.trackio_run_name.strip() or "eval"
+        suffix = f"_{args.mode}"
+        run_name = base_run if base_run.endswith(suffix) else base_run + suffix
         eval_config = {
             "mode": args.mode,
             "model_name_or_path": args.model_name_or_path,
@@ -989,6 +959,7 @@ def main() -> None:
             "max_source_len": args.max_source_len,
             "checkpoint_path": getattr(args, "checkpoint_path", "") or getattr(args, "sft_model_path", ""),
             "global_step": int(args.global_step),
+            "all_checkpoints": bool(args.all_checkpoints),
         }
         run = TrackioRun(
             project=args.trackio_project,
@@ -996,38 +967,190 @@ def main() -> None:
             config=eval_config,
             space_id=args.trackio_space_id or None,
         )
-        step = int(args.global_step)
 
-        flat_metrics: dict = {}
-        for k, v in results.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                flat_metrics[f"eval/{k}"] = float(v)
-        if flat_metrics:
-            run.log(flat_metrics, step=step)
+    # Resolve the (step, path) list to iterate over.
+    if args.all_checkpoints:
+        ckpt_dir = os.path.dirname(args.checkpoint_path) if args.checkpoint_path else None
+        if not ckpt_dir or not os.path.isdir(ckpt_dir):
+            raise ValueError(
+                f"--all_checkpoints requires --checkpoint_path pointing inside a directory; "
+                f"got {args.checkpoint_path!r}"
+            )
+        paths = sorted(
+            glob.glob(os.path.join(ckpt_dir, "model_step_*.safetensors")),
+            key=lambda p: int(re.search(r"model_step_(\d+)\.safetensors$", p).group(1)),
+        )
+        if not paths:
+            raise ValueError(f"No model_step_*.safetensors found in {ckpt_dir}")
+        ckpt_pairs = [
+            (int(re.search(r"model_step_(\d+)\.safetensors$", p).group(1)), p)
+            for p in paths
+        ]
+        print(f"\n=== --all_checkpoints: {len(ckpt_pairs)} checkpoints under {ckpt_dir} ===")
+    else:
+        ckpt_pairs = [(int(args.global_step), args.checkpoint_path)]
 
-        per_sample_ratios = []
-        limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
-        cr = max(int(args.compression_rate), 1)
-        enc_tok = dataset._enc_tok
-        dec_tok_hist = sft_tokenizer if args.mode == "sft" else model.tokenizer  # type: ignore[union-attr]
-        for idx in range(limit):
-            row_id = dataset._row_indices[idx]
-            text = dataset._hf[row_id]["input"]
-            s_len = len(dec_tok_hist(text, add_special_tokens=False, truncation=False)["input_ids"])
-            l_enc = min(len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]),
-                        dataset.max_source_len)
-            v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)
-            per_sample_ratios.append(s_len / v_len)
-        if per_sample_ratios:
-            run.log_histogram("eval/compression_ratio_dist", per_sample_ratios, step=step)
+    last_results: Dict = {}
+    for ckpt_step, ckpt_path in ckpt_pairs:
+        if args.all_checkpoints and ckpt_path:
+            print(f"\n[ckpt step={ckpt_step}] loading {ckpt_path}")
+            assert model is not None
+            state_dict = load_file(ckpt_path)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print(f"  loaded; missing={len(missing)} unexpected={len(unexpected)}")
+            model.eval()
+
+        # Per-ckpt cr: look up training cr from schedule, set model accordingly,
+        # and pull (or compute) compression stats for this cr.
+        if cr_schedule is not None:
+            assert model is not None
+            eval_cr = _training_cr_for_step(cr_schedule, int(ckpt_step))  # noqa: F821
+            print(f"  [cr_schedule] step={ckpt_step} → eval at cr={eval_cr}")
+            model.set_compression_rate(eval_cr)
+            comp_stats = _get_comp_stats(eval_cr)
+        else:
+            eval_cr = int(args.compression_rate)
+        assert comp_stats is not None
+
+        print(f"\n=== Teacher-forcing evaluation (mode={args.mode}, step={ckpt_step}) ===")
+        if args.mode == "cvlm":
+            assert model is not None
+            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
+        elif args.mode == "cvlm_shuffle":
+            assert model is not None
+            tf_metrics = eval_teacher_forcing_cvlm(
+                model, loader, device, args.max_samples, shuffle_source=True
+            )
+        elif args.mode == "baseline_llm":
+            assert model is not None
+            tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
+        elif args.mode == "baseline_llm_full":
+            assert model is not None
+            tf_metrics = eval_teacher_forcing_baseline_llm_full(model, loader, device, args.max_samples)
+        elif args.mode == "baseline_proj":
+            assert model is not None and proj is not None
+            tf_metrics = eval_teacher_forcing_baseline_proj(model, proj, loader, device, args.max_samples)
+        elif args.mode == "sft":
+            assert sft_decoder is not None
+            tf_metrics = eval_teacher_forcing_sft(sft_decoder, loader, device, args.max_samples)
+        else:
+            raise ValueError(f"Unknown mode: {args.mode}")
+
+        tf_metrics["mode"] = args.mode
+        print(f"  Perplexity:      {tf_metrics['perplexity']:.4f}")
+        print(f"  Token Accuracy:  {tf_metrics['token_accuracy']:.4f}")
+        print(f"  Avg Loss:        {tf_metrics['avg_loss']:.4f}")
+        print(f"  Samples:         {tf_metrics['n_samples']}")
+        print(f"  Decoder in-len mean/max: "
+              f"{tf_metrics.get('decoder_input_len_mean', 0):.1f} / "
+              f"{tf_metrics.get('decoder_input_len_max', 0)}")
+
+        total_nll = float(tf_metrics.get("total_answer_nll_nats", 0.0))
+        total_src = int(comp_stats.get("source_tokens_sum", 0))
+        bps = bits_per_source_token(total_nll, total_src)
+        # effective_context_reduction = source_tokens_mean / (decoder tokens actually
+        # consumed besides the answer). >1 means CVLM uses fewer decoder tokens than
+        # the full-text baseline would; ==1 is breakeven; <1 is augmentation.
+        if args.mode in ("cvlm", "cvlm_shuffle"):
+            mean_p = float(tf_metrics.get("prompt_len_mean_seen", 0.0))
+            mean_v = float(tf_metrics.get("vision_len_mean_seen", 0.0))
+            denom = mean_v + mean_p
+        elif args.mode in ("baseline_llm_full", "sft"):
+            denom = float(tf_metrics.get("full_prompt_len_mean_seen", 0.0))
+        elif args.mode == "baseline_llm":
+            # question-only; "context" for document tokens is effectively zero, so
+            # the ratio is undefined — leave as 0 for clarity in the JSON.
+            denom = 0.0
+        else:
+            denom = 0.0
+        eff_reduction = comp_stats["source_tokens_mean"] / denom if denom > 0 else 0.0
+        print(f"\n  bits_per_source_token       : {bps:.6f}")
+        print(f"  effective_context_reduction : {eff_reduction:.4f}  "
+              f"(source_tokens_mean / context_tokens_used)")
+
+        gen_metrics: Dict[str, float] = {}
+        if args.compute_generation_metrics:
+            print(f"\n=== Generation evaluation (mode={args.mode}, step={ckpt_step}) ===")
+            preds, refs = generate_answers(
+                model,
+                loader,
+                device,
+                args.max_new_tokens,
+                args.max_samples,
+                args.mode,
+                proj=proj,
+                sft_decoder=sft_decoder,
+                sft_tokenizer=sft_tokenizer,
+            )
+            gen_metrics = compute_generation_metrics(preds, refs)
+            print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
+            print(f"  ROUGE-2:       {gen_metrics['rouge2']:.4f}")
+            print(f"  ROUGE-L:       {gen_metrics['rougeL']:.4f}")
+            print(f"  BLEU-4:        {gen_metrics['bleu4']:.2f}")
+            print(f"  Exact Match:   {gen_metrics['exact_match']:.4f}")
+
+        results = {
+            **tf_metrics,
+            **gen_metrics,
+            **comp_stats,
+            "bits_per_source_token": bps,
+            "effective_context_reduction": eff_reduction,
+            "compression_rate": int(eval_cr),
+        }
+        last_results = results
+
+        # Per-checkpoint JSON. With --cr_schedule we suffix the basename with
+        # `_native` so we don't clobber prior fixed-cr eval JSONs alongside.
+        if args.output_json:
+            if args.all_checkpoints:
+                base, ext = os.path.splitext(args.output_json)
+                ext = ext or ".json"
+                if cr_schedule is not None:
+                    step_json = f"{base}_native_step{ckpt_step}{ext}"
+                else:
+                    step_json = f"{base}_step{ckpt_step}{ext}"
+            else:
+                step_json = args.output_json
+            os.makedirs(os.path.dirname(step_json) or ".", exist_ok=True)
+            with open(step_json, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"  wrote {step_json}")
+
+        # Log this checkpoint's metrics into the per-mode trackio run.
+        if run is not None:
+            flat_metrics = {
+                f"eval/{k}": float(v)
+                for k, v in results.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+            if flat_metrics:
+                run.log(flat_metrics, step=int(ckpt_step))
+
+    # Histogram is weight-independent — log once after the loop, at the LAST
+    # checkpoint's step so it lands on the final point of the scatter chart.
+    # Skip in --cr_schedule mode: cr varies per ckpt, a single global histogram
+    # would mix distributions and mislead.
+    if run is not None:
+        if cr_schedule is None:
+            per_sample_ratios = []
+            limit = len(dataset) if args.max_samples <= 0 else min(len(dataset), args.max_samples)
+            cr = max(int(args.compression_rate), 1)
+            enc_tok = dataset._enc_tok
+            dec_tok_hist = sft_tokenizer if args.mode == "sft" else model.tokenizer  # type: ignore[union-attr]
+            for idx in range(limit):
+                row_id = dataset._row_indices[idx]
+                text = dataset._hf[row_id]["input"]
+                s_len = len(dec_tok_hist(text, add_special_tokens=False, truncation=False)["input_ids"])
+                l_enc = min(len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]),
+                            dataset.max_source_len)
+                v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)
+                per_sample_ratios.append(s_len / v_len)
+            last_step = int(ckpt_pairs[-1][0])
+            if per_sample_ratios:
+                run.log_histogram("eval/compression_ratio_dist", per_sample_ratios, step=last_step)
         run.finish()
-        print(f"\nEval metrics logged to trackio (project={args.trackio_project} run={run_name} step={step})")
-
-    if args.output_json:
-        os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
-        with open(args.output_json, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved to {args.output_json}")
+        print(f"\nEval metrics logged to trackio (project={args.trackio_project} "
+              f"run={run_name}, {len(ckpt_pairs)} checkpoint(s))")
 
     print("\nDone.")
 
