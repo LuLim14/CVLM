@@ -1,10 +1,26 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import transformers
 from safetensors.torch import load_file
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, ViTModel
+
+# Patch HF's LlamaForCausalLM with fused Triton kernels (RoPE, RMSNorm, SwiGLU,
+# fused-linear-CE). Done at import time so any subsequent
+# AutoModelForCausalLM.from_pretrained(...) for a Llama-family model picks up
+# the patched forward. SmolLM-135M-Instruct is model_type=llama, so all four
+# optimisations apply.
+from liger_kernel.transformers import apply_liger_kernel_to_llama
+
+apply_liger_kernel_to_llama(
+    rope=True,
+    rms_norm=True,
+    swiglu=True,
+    fused_linear_cross_entropy=True,
+    cross_entropy=False,  # mutually exclusive with fused_linear_cross_entropy
+)
 
 
 @dataclass
@@ -18,6 +34,12 @@ class ModelArguments:
     embed_input_dim: int = field(default=768, metadata={"help": "Hidden size of the text encoder output (ModernBERT-base=768)."})
     max_vision_len: int = field(default=512, metadata={"help": "Max compressed-vision-sequence length; sizes the learned positional embedding."})
     compression_rate: int = field(default=4, metadata={"help": "Average-pool this many source tokens into one vision token."})
+    unfreeze_encoder_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "If >0, unfreeze the top-K transformer layers of the text encoder (plus final_norm) and allow gradient flow through them. 0 = legacy fully-frozen behaviour."
+        },
+    )
     train: bool = field(
         default=True,
         metadata={
@@ -71,19 +93,36 @@ class Projector(torch.nn.Module):
         return x
 
 
-def _chunked_mean_pool(
+def _chunked_attention_pool(
     hidden: torch.Tensor,
     source_attention_mask: torch.Tensor,
     compression_rate: int,
     max_vision_len: int,
+    pool_query: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mean-pool contiguous chunks of `compression_rate` real tokens per sample.
+    """Pool contiguous chunks of `compression_rate` real tokens per sample.
+
+    When ``pool_query`` is None, falls back to plain unweighted mean-pool
+    (legacy behaviour). When ``pool_query`` is provided (shape [H]), each
+    chunk is reduced via softmax-weighted attention:
+
+        scores  = (chunk_tokens @ pool_query) / sqrt(H)   # [cr]
+        weights = softmax(scores)                         # [cr]
+        v_i     = sum(weights * chunk_tokens)             # [H]
+
+    The padded tail of the last chunk (when L_real % cr != 0) is masked out
+    with -inf scores so it carries zero softmax weight. With pool_query
+    initialised to zeros, all scores are zero, softmax is uniform over the
+    real tokens of the chunk, and the output is bit-identical to mean-pool —
+    so this is a strict drop-in generalisation that starts at mean-pool and
+    can only improve from there.
 
     Args:
         hidden: [B, L, H] encoder output (any dtype).
         source_attention_mask: [B, L] long/int mask (1 for real, 0 for pad).
         compression_rate: pool size.
         max_vision_len: hard cap on output V per sample (truncates longer docs).
+        pool_query: optional [H] learnable parameter; None -> mean-pool.
 
     Returns:
         pooled: [B, V_max, H] where V_max = max V_i across batch.
@@ -105,6 +144,11 @@ def _chunked_mean_pool(
     pooled = torch.zeros((B, V_max, H), dtype=hidden.dtype, device=hidden.device)
     v_mask = torch.zeros((B, V_max), dtype=torch.long, device=hidden.device)
 
+    if pool_query is not None:
+        scale = float(H) ** -0.5
+        # Cast pool_query to hidden's dtype for bf16 paths.
+        q = pool_query.to(dtype=hidden.dtype)
+
     for b in range(B):
         L_real = int(lens[b])
         V_i = int(V_list[b])
@@ -116,12 +160,24 @@ def _chunked_mean_pool(
         pad = V_i * cr - L_use
         if pad > 0:
             h = torch.nn.functional.pad(h, (0, 0, 0, pad))  # zero-pad tail
-        chunked = h.view(V_i, cr, H).mean(dim=1)    # [V_i, H]
-        if pad > 0:
-            # Last chunk's mean was divided by cr, should be divided by (cr - pad).
-            true_last = cr - pad
-            chunked[-1] = chunked[-1] * cr / true_last
-        pooled[b, :V_i] = chunked
+        chunked = h.view(V_i, cr, H)                # [V_i, cr, H]
+
+        if pool_query is None:
+            chunk_pooled = chunked.mean(dim=1)      # [V_i, H]
+            if pad > 0:
+                # Last chunk's mean was divided by cr, should be divided by (cr - pad).
+                true_last = cr - pad
+                chunk_pooled[-1] = chunk_pooled[-1] * cr / true_last
+        else:
+            scores = (chunked @ q) * scale          # [V_i, cr]
+            if pad > 0:
+                # Mask padded tail of the LAST chunk only.
+                neg_inf = torch.finfo(scores.dtype).min
+                scores[-1, cr - pad:] = neg_inf
+            weights = torch.softmax(scores, dim=-1)        # [V_i, cr]
+            chunk_pooled = (weights.unsqueeze(-1) * chunked).sum(dim=1)  # [V_i, H]
+
+        pooled[b, :V_i] = chunk_pooled
         v_mask[b, :V_i] = 1
 
     return pooled, v_mask
@@ -163,6 +219,14 @@ class CVLM(torch.nn.Module):
         self.vision_pos_embed = nn.Embedding(self.max_vision_len, self.vision_encoder.config.hidden_size)
         nn.init.normal_(self.vision_pos_embed.weight, std=0.02)
 
+        # Learnable per-token query for attention pooling over each chunk of
+        # `compression_rate` encoder tokens. Zero-init makes the softmax uniform
+        # over real chunk tokens at step 0, which reduces _chunked_attention_pool
+        # to plain mean-pool — so this is a strict drop-in generalisation.
+        # Old checkpoints lacking this parameter load via strict=False with a
+        # zero-init pool_query and behave identically to legacy mean-pool.
+        self.pool_query = nn.Parameter(torch.zeros(enc_hidden))
+
         if training_args.bf16:
             self.text_projector.to(torch.bfloat16)
             self.vision_projector.to(torch.bfloat16)
@@ -187,14 +251,91 @@ class CVLM(torch.nn.Module):
     def _freeze_frozen_submodules(self):
         freeze_model(self.text_encoder)
         self.text_encoder.eval()
+        k = int(getattr(self.model_args, "unfreeze_encoder_top_k", 0) or 0)
+        if k <= 0:
+            return
+        # Locate the transformer layer container. ModernBERT uses .layers; HF
+        # bert-style models nest at .encoder.layer. Support both.
+        layers = getattr(self.text_encoder, "layers", None)
+        if layers is None:
+            inner_enc = getattr(self.text_encoder, "encoder", None)
+            layers = getattr(inner_enc, "layer", None) if inner_enc is not None else None
+        if layers is None:
+            raise RuntimeError(
+                "Cannot locate text_encoder transformer layers for top-K unfreeze; "
+                "expected .layers or .encoder.layer attribute."
+            )
+        L = len(layers)
+        k_eff = min(k, L)
+        for layer in layers[L - k_eff:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        # Final layer norm sits on top of the stack — unfreeze with the top block
+        # so its grad can update.
+        for attr in ("final_norm", "norm", "LayerNorm"):
+            mod = getattr(self.text_encoder, attr, None)
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = True
+                break
+        # Switch to train mode so dropout in the unfrozen blocks is active.
+        # Frozen lower layers' params still have requires_grad=False so they
+        # receive no parameter gradients.
+        self.text_encoder.train()
+
+    def set_compression_rate(self, cr: int) -> None:
+        """Mutate compression_rate for subsequent forward passes.
+
+        Safe to call at any optimizer-step boundary: _chunked_attention_pool
+        reads self.compression_rate fresh each call, no graph state to migrate,
+        no parameters added or removed.
+        """
+        cr = int(cr)
+        if cr < 1:
+            raise ValueError(f"compression_rate must be >= 1, got {cr}")
+        self.compression_rate = cr
 
     def _init_training(self):
-        print("Freezing the decoder and text encoder...")
+        print("Decoder is trainable; freezing the text encoder...")
         self._freeze_frozen_submodules()
-        # Sanity assertion: the two landmines from the plan.
-        assert all(not p.requires_grad for p in self.text_encoder.parameters()), \
-            "text_encoder must be frozen"
+        k_enc = int(getattr(self.model_args, "unfreeze_encoder_top_k", 0) or 0)
+        if k_enc <= 0:
+            assert all(not p.requires_grad for p in self.text_encoder.parameters()), \
+                "text_encoder must be frozen when unfreeze_encoder_top_k=0"
+        else:
+            n_train_enc = sum(p.requires_grad for p in self.text_encoder.parameters())
+            n_total_enc = sum(1 for _ in self.text_encoder.parameters())
+            print(
+                f"text_encoder: top-{k_enc} layers + final_norm UNFROZEN "
+                f"({n_train_enc}/{n_total_enc} param tensors trainable)"
+            )
         print_trainable_parameters(self)
+
+        if getattr(self.training_args, "gradient_checkpointing", False):
+            # Activation checkpointing on the activation-heavy submodules.
+            # use_reentrant=False is the modern PyTorch 2.x non-reentrant path:
+            # supports gradient flowing through inputs (we need this — vision
+            # input enters ViT from the trainable text_projector, and decoder
+            # input enters from the trainable vision_projector chain) and
+            # avoids the reentrant deprecation warning. No
+            # enable_input_require_grads() needed because both decoder and ViT
+            # have requires_grad=True params.
+            self.decoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+            self.vision_encoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+            msg = "Gradient checkpointing: ENABLED on decoder + vision_encoder"
+            if k_enc > 0 and hasattr(self.text_encoder, "gradient_checkpointing_enable"):
+                # text_encoder input is integer ids (no upstream grad); non-reentrant
+                # gc handles that correctly without enable_input_require_grads.
+                self.text_encoder.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+                msg += " + text_encoder"
+            print(msg)
+
         if self.training_args.restore_from:
             print(f"Loading from the pretrained checkpoint: {self.training_args.restore_from}...")
             state_dict = load_file(self.training_args.restore_from)
@@ -203,22 +344,34 @@ class CVLM(torch.nn.Module):
             print(f"  restored; missing={len(missing)} unexpected={len(unexpected)}")
 
     def _encode_vision(self, source_input_ids, source_attention_mask):
-        """source text ids -> frozen text encoder -> chunked pool -> ViT encoder (+pos) -> vision_projector."""
-        # Encoder runs inside no_grad so the 12-layer activation chain is not kept
-        # alive for backward. Its params have requires_grad=False, but downstream
-        # trainable modules would otherwise force autograd to build the full graph.
-        with torch.no_grad():
+        """source text ids -> text encoder -> chunked pool -> ViT encoder (+pos) -> vision_projector."""
+        # When the encoder is fully frozen (unfreeze_encoder_top_k=0) we wrap it
+        # in no_grad so the 22-layer activation chain is not kept alive for the
+        # downstream backward pass. When top-K layers are unfrozen and we are
+        # training, gradient must flow back through the encoder's top block so
+        # we drop the no_grad — frozen lower layers still get no parameter grad
+        # (requires_grad=False); their activation memory is bounded by the
+        # encoder's gradient checkpointing if enabled.
+        k_enc = int(getattr(self.model_args, "unfreeze_encoder_top_k", 0) or 0)
+        if k_enc > 0 and self.training:
             enc_out = self.text_encoder(
                 input_ids=source_input_ids,
                 attention_mask=source_attention_mask,
             ).last_hidden_state                     # [B, L, H_enc] in compute_dtype
-        enc_out = enc_out.detach()
+        else:
+            with torch.no_grad():
+                enc_out = self.text_encoder(
+                    input_ids=source_input_ids,
+                    attention_mask=source_attention_mask,
+                ).last_hidden_state                 # [B, L, H_enc] in compute_dtype
+            enc_out = enc_out.detach()
 
-        pooled, vision_attention_mask = _chunked_mean_pool(
+        pooled, vision_attention_mask = _chunked_attention_pool(
             enc_out,
             source_attention_mask,
             compression_rate=self.compression_rate,
             max_vision_len=self.max_vision_len,
+            pool_query=self.pool_query,
         )                                           # [B, V_max, H_enc], [B, V_max]
 
         vit_input = self.text_projector(pooled)     # [B, V_max, vit_dim]
@@ -267,15 +420,31 @@ class CVLM(torch.nn.Module):
         ignore = torch.full((batch_size, P + V), -100, dtype=labels_src.dtype, device=labels_src.device)
         labels = torch.cat([ignore, labels_src], dim=1)
 
-        decoder_outputs = self.decoder(
-            inputs_embeds=decoder_input,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-        logits = decoder_outputs.logits
-        effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
-        target = labels[:, 1:].reshape(-1)
-        loss = self.loss_fct(effective_logits, target)
+        if self.training:
+            # Train: pass labels so Liger's fused-linear-CE fuses lm_head x
+            # labels into one Triton kernel and never materialises the
+            # [B, L, vocab] logits tensor. decoder_outputs.logits is None.
+            decoder_outputs = self.decoder(
+                inputs_embeds=decoder_input,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=False,
+            )
+            loss = decoder_outputs.loss
+            logits = decoder_outputs.logits  # None under fused-linear-CE
+        else:
+            # Eval: callers (eval_cvlm.py) need logits for per-token loss and
+            # argmax accuracy. Skip fused-CE here; eval runs in no_grad so
+            # there is no activation pressure to save.
+            decoder_outputs = self.decoder(
+                inputs_embeds=decoder_input,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            logits = decoder_outputs.logits
+            effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+            target = labels[:, 1:].reshape(-1)
+            loss = self.loss_fct(effective_logits, target)
         return {
             "loss": loss,
             "logits": logits,

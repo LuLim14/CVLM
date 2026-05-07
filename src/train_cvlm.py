@@ -6,7 +6,7 @@ import argparse
 import os
 import random
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +28,78 @@ from train_utils import (
 )
 
 
+def _parse_cr_schedule(s: Optional[str]) -> Optional[List[Tuple[int, int]]]:
+    """Parse a "cr:end_step,..." schedule string.
+
+    Returns None for empty/None input. Raises ValueError on malformed input.
+    Last entry's end_step MUST be 0 (sentinel for +inf). Non-last entries'
+    end_step must be strictly increasing positive integers.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    out: List[Tuple[int, int]] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            raise ValueError(f"cr_schedule token {tok!r} missing ':' separator")
+        cr_str, end_str = tok.split(":", 1)
+        try:
+            cr = int(cr_str.strip())
+            end_step = int(end_str.strip())
+        except ValueError:
+            raise ValueError(f"cr_schedule token {tok!r} has non-integer fields")
+        if cr < 1:
+            raise ValueError(f"cr_schedule cr={cr} must be >= 1")
+        if end_step < 0:
+            raise ValueError(f"cr_schedule end_step={end_step} must be >= 0")
+        out.append((cr, end_step))
+    if not out:
+        return None
+    if out[-1][1] != 0:
+        raise ValueError(
+            f"cr_schedule last entry must have end_step=0 (sentinel for +inf); "
+            f"got {out[-1]}"
+        )
+    prev_end = 0
+    for i, (_, end) in enumerate(out[:-1]):
+        if end <= prev_end:
+            raise ValueError(
+                f"cr_schedule end_step values must be strictly increasing; "
+                f"entry {i} has end_step={end} <= previous {prev_end}"
+            )
+        prev_end = end
+    return out
+
+
+def _active_cr(schedule: List[Tuple[int, int]], step: int) -> int:
+    """Return the cr for the bucket containing `step`.
+
+    The last entry's end_step=0 is treated as +inf.
+    """
+    for cr, end_step in schedule:
+        if end_step == 0 or step < end_step:
+            return cr
+    raise RuntimeError(f"no active cr for step={step} in schedule={schedule}")
+
+
+def _training_cr_for_step(schedule: List[Tuple[int, int]], step: int) -> int:
+    """Return the cr that PRODUCED the weights at `step`.
+
+    Differs from `_active_cr` at transition boundary steps: at end_step=N, the
+    saved checkpoint contains weights trained at the *previous* stage's cr (the
+    forced save fires at the end_step boundary BEFORE any training at the new
+    cr). This helper returns the producing cr by using `step <= end_step`.
+    Used by eval to map saved checkpoints back to the cr that trained them.
+    """
+    for cr, end_step in schedule:
+        if end_step == 0 or step <= end_step:
+            return cr
+    raise RuntimeError(f"no training cr for step={step} in schedule={schedule}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train CVLM (on-the-fly text-encoder variant).")
     p.add_argument("--output_dir", type=str, required=True)
@@ -40,6 +112,13 @@ def parse_args() -> argparse.Namespace:
                    help="HF id for the frozen text encoder (default: answerdotai/ModernBERT-base).")
     p.add_argument("--compression_rate", type=int, default=4,
                    help="Chunk size for mean-pool over encoder tokens into vision tokens.")
+    p.add_argument(
+        "--unfreeze_encoder_top_k",
+        type=int,
+        default=int(os.environ.get("UNFREEZE_ENCODER_TOP_K", "0")),
+        help="Unfreeze the top-K transformer layers of the text encoder (plus final_norm). "
+             "0 (default) = encoder fully frozen, legacy behaviour.",
+    )
     p.add_argument("--max_samples", type=int, default=0,
                    help="Cap HF dataset to first N rows (0 = all).")
     p.add_argument(
@@ -77,6 +156,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable_warmup", action="store_true")
     p.add_argument("--warmup_ratio", type=int, default=0)
     p.add_argument("--warmup_steps", type=int, default=0)
+    p.add_argument(
+        "--disable_lr_schedule",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("DISABLE_LR_SCHEDULE", "0") == "1",
+        help="If set, skip cosine LR decay — keep LR constant at init_lr after warmup. "
+             "Useful for compression-rate curricula where late stages need fresh LR.",
+    )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument(
         "--save_interval_steps",
@@ -121,6 +207,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Override CSV metric file location. Defaults to <output_dir>/metrics.csv.",
+    )
+    p.add_argument(
+        "--cr_schedule",
+        type=str,
+        default=os.environ.get("CR_SCHEDULE", ""),
+        help=(
+            "Compression-rate curriculum, comma-separated 'cr:end_step' pairs. "
+            "Last entry's end_step must be 0 (sentinel for forever). "
+            "Empty (default) = static cr from --compression_rate. "
+            "Example: '1:6000,2:12000,4:18000,8:0'."
+        ),
+    )
+    p.add_argument(
+        "--gradient_checkpointing",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("GRADIENT_CHECKPOINTING", "1") != "0",
+        help="Enable activation checkpointing on decoder + ViT (default: on; "
+             "override via env GRADIENT_CHECKPOINTING=0 or --gradient_checkpointing=false).",
     )
     p.add_argument(
         "--trackio_project",
@@ -186,13 +290,46 @@ def main() -> None:
         model_args.text_encoder_name = args.text_encoder_name
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
+    model_args.unfreeze_encoder_top_k = int(args.unfreeze_encoder_top_k)
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
     training_args.restore_from = args.restore_from or ""
+    training_args.gradient_checkpointing = args.gradient_checkpointing
 
     model = CVLM(model_args, training_args)
     model.to(device)
+
+    # ---- compression-rate curriculum ------------------------------------
+    cr_schedule = _parse_cr_schedule(args.cr_schedule)
+    if cr_schedule is not None:
+        # Validate vision-len budget for the smallest cr in the schedule.
+        min_cr = min(cr for cr, _ in cr_schedule)
+        effective_src = (
+            args.max_source_len
+            if args.max_source_len > 0
+            else args.compression_rate * args.max_vision_len
+        )
+        required_vl = (effective_src + min_cr - 1) // min_cr
+        if args.max_vision_len < required_vl:
+            raise ValueError(
+                f"max_vision_len={args.max_vision_len} too small for cr_schedule "
+                f"min_cr={min_cr} with effective_source_len={effective_src} "
+                f"(needs >= {required_vl}). Raise cr_min in the schedule, "
+                f"raise --max_vision_len, or lower --max_source_len."
+            )
+        first_cr = cr_schedule[0][0]
+        if first_cr != args.compression_rate and is_master:
+            print(
+                f"[warn] cr_schedule overrides --compression_rate; "
+                f"using first-stage cr={first_cr} "
+                f"(--compression_rate was {args.compression_rate})"
+            )
+        unwrap_model(model).set_compression_rate(first_cr)
+        current_cr = first_cr
+    else:
+        current_cr = args.compression_rate
+    # ---------------------------------------------------------------------
 
     dec_pad = model.tokenizer.pad_token_id
     enc_pad = model.encoder_tokenizer.pad_token_id
@@ -317,6 +454,7 @@ def main() -> None:
             "vision_encoder_name": getattr(model_args, "vision_encoder_name", ""),
             "compression_rate": args.compression_rate,
             "max_vision_len": args.max_vision_len,
+            "unfreeze_encoder_top_k": int(args.unfreeze_encoder_top_k),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -336,7 +474,11 @@ def main() -> None:
 
     model.train()
     # Frozen sub-modules must stay in eval mode (no dropout noise on frozen weights).
-    unwrap_model(model).text_encoder.eval()
+    # When the encoder is partially unfrozen (top-K), keep it in train() mode so
+    # dropout in the unfrozen blocks fires; lower frozen layers receive no
+    # parameter gradients regardless of the train/eval flag.
+    if int(args.unfreeze_encoder_top_k) <= 0:
+        unwrap_model(model).text_encoder.eval()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
     pgs = -1
 
@@ -405,9 +547,27 @@ def main() -> None:
                     )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                if global_step > warmup_steps:
+                if global_step > warmup_steps and not args.disable_lr_schedule:
                     lr_scheduler.step()
                 global_step += 1
+                if cr_schedule is not None:
+                    cr_now = _active_cr(cr_schedule, global_step)
+                    if cr_now != current_cr:
+                        unwrap_model(model).set_compression_rate(cr_now)
+                        if is_master:
+                            print(f"[step {global_step}] cr {current_cr} -> {cr_now}")
+                            save_cvlm_checkpoint(
+                                args.output_dir,
+                                model,
+                                optimizer,
+                                lr_scheduler,
+                                next_start_epoch=local_epoch,
+                                global_step=global_step,
+                                is_master=True,
+                            )
+                        current_cr = cr_now
+                if trackio_run is not None and is_master:
+                    trackio_run.log({"train/compression_rate": float(current_cr)}, step=global_step)
 
             t1 = time.perf_counter()
             batch_time = t1 - t0
@@ -503,6 +663,11 @@ def main() -> None:
 
     if is_master:
         print("Training finished.")
+        if torch.cuda.is_available():
+            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            print(f"[train] peak GPU memory: {peak_gb:.2f} GB")
+            if trackio_run is not None and trackio_run.enabled:
+                trackio_run.log({"system/peak_gpu_gb": peak_gb}, step=global_step)
 
     if trackio_run is not None:
         trackio_run.finish()

@@ -106,7 +106,7 @@ class CvlmTrainDataset(Dataset):
             truncation=True,
             max_length=self.max_source_len,
             return_tensors=None,
-        )
+        ) # TODO: is it good that we use truncated? But we use from _row_indices that prepered from __init__
         # Prompt is the user's *question* about the document, not the document
         # itself. The document goes into `source_ids` (to be compressed into
         # vision tokens); the question stays as raw prompt tokens.
