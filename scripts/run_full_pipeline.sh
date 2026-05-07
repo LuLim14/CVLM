@@ -31,25 +31,24 @@ export PYTHONUNBUFFERED=1
 # -----------------------------------------------------------------------------
 # Configuration (override by exporting env vars before running the script).
 # -----------------------------------------------------------------------------
-OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)}"
 DATASET_NAME="${DATASET_NAME:-sggetao/PwC}"
 
 # Model
-MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM-135M-Instruct}"
+MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
 TEXT_ENCODER_NAME="${TEXT_ENCODER_NAME:-answerdotai/ModernBERT-base}"
 
 # Train
-EPOCHS="${EPOCHS:-2}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+EPOCHS="${EPOCHS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_ANSWER_LEN="${MAX_ANSWER_LEN:-1024}"
-MAX_VISION_LEN="${MAX_VISION_LEN:-256}"
+MAX_VISION_LEN="${MAX_VISION_LEN:-1024}"
 MAX_SOURCE_LEN="${MAX_SOURCE_LEN:-0}"      # 0 = compression_rate * max_vision_len
-COMPRESSION_RATE="${COMPRESSION_RATE:-4}"
+COMPRESSION_RATE="${COMPRESSION_RATE:-1}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"            # cap HF dataset rows; 0 = all
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-LOG_INTERVAL="${LOG_INTERVAL:-350}"
+LOG_INTERVAL="${LOG_INTERVAL:-10}"
 SAVE_INTERVAL_STEPS="${SAVE_INTERVAL_STEPS:-0}"
 NPROC="${NPROC:-1}"
 # Linear warmup stabilises the first ~100 optimizer steps. With the projectors
@@ -57,6 +56,15 @@ NPROC="${NPROC:-1}"
 # warmup clip=1.0 silently discards most of those updates.
 ENABLE_WARMUP="${ENABLE_WARMUP:-1}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
+UNFREEZE_ENCODER_TOP_K="${UNFREEZE_ENCODER_TOP_K:-22}"   # 0 = encoder fully frozen; >0 unfreezes top-K layers + final_norm, 22 == fully unreeze for ModerBert
+CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:0}"   # empty = static cr from COMPRESSION_RATE
+DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup (no cosine decay)
+
+# Output dir — default name embeds main hyperparameters for easy A/B comparison.
+# Override by exporting OUTPUT_DIR=/abs/path before running the script.
+OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}}"
+# OUTPUT_DIR="/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260506_011615_cr1_vl1024_sl0_bs64_lr1e-4_ep8_gc1"
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
@@ -67,6 +75,8 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-${BATCH_SIZE}}"
 # upper bound with full document), baseline_proj (random-projection ablation).
 EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm baseline_llm_full baseline_proj}"
 EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation metrics
+EVAL_ALL_CHECKPOINTS="${EVAL_ALL_CHECKPOINTS:-1}"  # 1 = sweep every model_step_*.safetensors
+EVAL_CR_SCHEDULE="${EVAL_CR_SCHEDULE:-"1:6000,2:12000,4:18000,8:0"}"           # if set + EVAL_ALL_CHECKPOINTS=1, eval each ckpt at the cr that trained it
 
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
@@ -101,8 +111,14 @@ echo "  MAX_SOURCE_LEN    = ${MAX_SOURCE_LEN} (0 = cr*max_vision_len)"
 echo "  COMPRESSION_RATE  = ${COMPRESSION_RATE}"
 echo "  MAX_SAMPLES       = ${MAX_SAMPLES} (0 = all)"
 echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
+echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
+echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
+echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
+echo "  DISABLE_LR_SCHEDULE = ${DISABLE_LR_SCHEDULE}"
 echo "  EVAL_MODES        = ${EVAL_MODES}"
 echo "  EVAL_COMPUTE_GEN  = ${EVAL_COMPUTE_GEN}"
+echo "  EVAL_ALL_CHECKPOINTS = ${EVAL_ALL_CHECKPOINTS}"
+echo "  EVAL_CR_SCHEDULE     = ${EVAL_CR_SCHEDULE:-<static>}"
 echo "  TB_DIR            = ${TB_DIR}"
 echo "  LOG_FILE          = ${LOG_FILE}"
 echo "  TRACKIO_PROJECT   = ${TRACKIO_PROJECT}"
@@ -141,6 +157,10 @@ TRAIN_ARGS=(
   --log_interval "${LOG_INTERVAL}"
   --save_interval_steps "${SAVE_INTERVAL_STEPS}"
   --tensorboard_dir "${TB_DIR}/train"
+  --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
+  --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
+  --cr_schedule "${CR_SCHEDULE}"
+  --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
 )
 if [[ "${ENABLE_WARMUP}" == "1" ]]; then
   TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
@@ -190,6 +210,18 @@ for MODE in ${EVAL_MODES}; do
   )
   if [[ "${EVAL_COMPUTE_GEN}" == "1" ]]; then
     EVAL_CMD+=( --compute_generation_metrics )
+  fi
+  if [[ "${EVAL_ALL_CHECKPOINTS}" == "1" ]]; then
+    EVAL_CMD+=( --all_checkpoints )
+  fi
+  # Per-ckpt cr lookup is only meaningful for cr-dependent modes; the cvlm/
+  # cvlm_shuffle/baseline_proj modes use it. baseline_llm{,_full} ignore cr.
+  if [[ -n "${EVAL_CR_SCHEDULE}" && "${EVAL_ALL_CHECKPOINTS}" == "1" ]]; then
+    case "${MODE}" in
+      cvlm|cvlm_shuffle|baseline_proj)
+        EVAL_CMD+=( --cr_schedule "${EVAL_CR_SCHEDULE}" )
+        ;;
+    esac
   fi
   "${EVAL_CMD[@]}"
 done

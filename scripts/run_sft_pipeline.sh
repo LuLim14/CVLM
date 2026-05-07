@@ -63,7 +63,7 @@ COMPRESSION_RATE="${COMPRESSION_RATE:-4}"
 
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
-TRACKIO_RUN_NAME="${TRACKIO_RUN_NAME:-$(basename "${OUTPUT_DIR}")}"
+TRACKIO_RUN_NAME="${TRACKIO_RUN_NAME:-$(basename "${OUTPUT_DIR}")_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_pl${MAX_PROMPT_LEN}_al${MAX_ANSWER_LEN}}"
 TRACKIO_DISABLE="${TRACKIO_DISABLE:-0}"
 export TRACKIO_PROJECT TRACKIO_RUN_NAME TRACKIO_DISABLE
 # Only export TRACKIO_SPACE_ID when set non-empty: trackio reads the env var
