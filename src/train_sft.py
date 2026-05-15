@@ -37,6 +37,29 @@ from transformers import (
     TrainingArguments,
 )
 
+# Patch decoder family with fused Triton kernels (RoPE, RMSNorm, SwiGLU,
+# fused-linear-CE) BEFORE any `AutoModelForCausalLM.from_pretrained(...)`.
+# fused_linear_cross_entropy is the critical one: it fuses lm_head matmul +
+# log-softmax + NLL into a single kernel and never materialises the full
+# `[B, L, vocab]` fp32 logits tensor. For Qwen3 (vocab=151936) this is the
+# difference between fitting and OOM — unfused fp32 logits at B=4, L=1536 are
+# already ~3.7 GB and several copies live simultaneously during backward.
+from transformers import AutoConfig
+from liger_kernel.transformers.auto_model import MODEL_TYPE_TO_APPLY_LIGER_FN
+
+
+def _apply_liger_for(model_name_or_path: str) -> None:
+    cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    mt = getattr(cfg, "model_type", "")
+    fn = MODEL_TYPE_TO_APPLY_LIGER_FN.get(mt)
+    if fn is None:
+        print(f"[train_sft] WARN: no liger patch for model_type={mt!r}; "
+              f"expect large unfused fp32 logits tensors at high vocab.")
+        return
+    fn(rope=True, rms_norm=True, swiglu=True,
+       fused_linear_cross_entropy=True, cross_entropy=False)
+    print(f"[train_sft] applied {fn.__name__} (model_type={mt})")
+
 
 # -----------------------------------------------------------------------------
 # Dataset
@@ -304,6 +327,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_interval_steps", type=int, default=500,
                    help="Save every N optimizer steps. 0 = end of training only.")
     p.add_argument("--no_bf16", action="store_true")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable activation checkpointing on the decoder. "
+                        "~30%% slower step, but cuts activation memory ~5-8x — "
+                        "lets you fit larger per-device batch with the same VRAM.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--plot_interval", type=int, default=100)
     p.add_argument("--csv_path", type=str, default="")
@@ -326,6 +353,7 @@ def main() -> None:
     use_bf16 = torch.cuda.is_available() and not args.no_bf16
 
     print(f"[train_sft] Loading tokenizer + model: {args.model_name_or_path}")
+    _apply_liger_for(args.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -334,6 +362,13 @@ def main() -> None:
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
     )
     model.config.pad_token_id = tokenizer.pad_token_id
+    if args.gradient_checkpointing:
+        # use_cache must be off — kv-cache and checkpointing are incompatible
+        # (cache stores activations the checkpoint discards).
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     train_ds = SftFullDocDataset(
         hf_dataset_name=args.dataset_name,
@@ -356,7 +391,6 @@ def main() -> None:
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        overwrite_output_dir=False,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -401,7 +435,7 @@ def main() -> None:
         args=training_args,
         train_dataset=train_ds,
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         callbacks=[
             PngLoggingCallback(args.output_dir, csv_path, args.plot_interval),
             TrackioCallback(

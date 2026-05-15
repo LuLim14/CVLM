@@ -36,9 +36,12 @@ DATASET_NAME="${DATASET_NAME:-sggetao/PwC}"
 # Model
 MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
 TEXT_ENCODER_NAME="${TEXT_ENCODER_NAME:-answerdotai/ModernBERT-base}"
+# Must be loadable as transformers.ViTModel (not CLIP/SigLIP/DINO without code changes).
+VISION_ENCODER_NAME="${VISION_ENCODER_NAME:-google/vit-base-patch16-224}"
+# VISION_ENCODER_NAME="${VISION_ENCODER_NAME:-google/vit-large-patch16-224}" # Lets try with another vision encoder
 
 # Train
-EPOCHS="${EPOCHS:-8}"
+EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-4}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
@@ -58,25 +61,32 @@ ENABLE_WARMUP="${ENABLE_WARMUP:-1}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 UNFREEZE_ENCODER_TOP_K="${UNFREEZE_ENCODER_TOP_K:-22}"   # 0 = encoder fully frozen; >0 unfreezes top-K layers + final_norm, 22 == fully unreeze for ModerBert
-CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:0}"   # empty = static cr from COMPRESSION_RATE
+NUM_POOL_LATENTS="${NUM_POOL_LATENTS:-4}"                # K learnable queries per chunk for the attention pool; K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to 1 vision token per chunk
+
+# 1 = plain projectors (no input_norm.* in safetensors — old runs before RMSNorm)
+LEGACY_PROJECTOR="${LEGACY_PROJECTOR:-0}"
+export LEGACY_PROJECTOR
+
+CR_SCHEDULE="${CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"   # empty = static cr from COMPRESSION_RATE
 DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup (no cosine decay)
 
 # Output dir — default name embeds main hyperparameters for easy A/B comparison.
 # Override by exporting OUTPUT_DIR=/abs/path before running the script.
-OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}}"
-# OUTPUT_DIR="/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260506_011615_cr1_vl1024_sl0_bs64_lr1e-4_ep8_gc1"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_layer_norm_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
+# OUTPUT_DIR=/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260514_004851_qwen3_1.7b_cr1_vl1024_sl0_bs64_lr1e-4_ep10_gc1_unfrzed22_lt4
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-${BATCH_SIZE}}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 # Default eval suite covers: cvlm (method), cvlm_shuffle (source-relevance sanity
 # check), baseline_llm (no-document lower bound), baseline_llm_full (oracle
 # upper bound with full document), baseline_proj (random-projection ablation).
-EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm baseline_llm_full baseline_proj}"
+EVAL_MODES="${EVAL_MODES:-cvlm baseline_llm baseline_llm_full}"
 EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"  # 1 = run ROUGE / BLEU generation metrics
+NUM_CACHED_SAMPLES="${NUM_CACHED_SAMPLES:-16}"   # N decoded {doc,q,ref,pred} tuples dumped per ckpt next to eval JSON; 0 disables
 EVAL_ALL_CHECKPOINTS="${EVAL_ALL_CHECKPOINTS:-1}"  # 1 = sweep every model_step_*.safetensors
-EVAL_CR_SCHEDULE="${EVAL_CR_SCHEDULE:-"1:6000,2:12000,4:18000,8:0"}"           # if set + EVAL_ALL_CHECKPOINTS=1, eval each ckpt at the cr that trained it
+EVAL_CR_SCHEDULE="${EVAL_CR_SCHEDULE:-1:6000,2:12000,4:18000,8:24000,16:0}"           # if set + EVAL_ALL_CHECKPOINTS=1, eval each ckpt at the cr that trained it
 
 # trackio (replaces TensorBoard for the live UI)
 TRACKIO_PROJECT="${TRACKIO_PROJECT:-cvlm}"
@@ -106,6 +116,7 @@ echo "  OUTPUT_DIR        = ${OUTPUT_DIR}"
 echo "  DATASET_NAME      = ${DATASET_NAME}"
 echo "  MODEL_NAME        = ${MODEL_NAME}"
 echo "  TEXT_ENCODER_NAME = ${TEXT_ENCODER_NAME}"
+echo "  VISION_ENCODER_NAME = ${VISION_ENCODER_NAME}"
 echo "  MAX_VISION_LEN    = ${MAX_VISION_LEN}"
 echo "  MAX_SOURCE_LEN    = ${MAX_SOURCE_LEN} (0 = cr*max_vision_len)"
 echo "  COMPRESSION_RATE  = ${COMPRESSION_RATE}"
@@ -113,10 +124,13 @@ echo "  MAX_SAMPLES       = ${MAX_SAMPLES} (0 = all)"
 echo "  ENABLE_WARMUP     = ${ENABLE_WARMUP} (steps=${WARMUP_STEPS})"
 echo "  GRADIENT_CHECKPOINTING = ${GRADIENT_CHECKPOINTING}"
 echo "  UNFREEZE_ENCODER_TOP_K = ${UNFREEZE_ENCODER_TOP_K}"
+echo "  NUM_POOL_LATENTS  = ${NUM_POOL_LATENTS}"
+echo "  LEGACY_PROJECTOR  = ${LEGACY_PROJECTOR}"
 echo "  CR_SCHEDULE       = ${CR_SCHEDULE:-<static>}"
 echo "  DISABLE_LR_SCHEDULE = ${DISABLE_LR_SCHEDULE}"
 echo "  EVAL_MODES        = ${EVAL_MODES}"
 echo "  EVAL_COMPUTE_GEN  = ${EVAL_COMPUTE_GEN}"
+echo "  NUM_CACHED_SAMPLES   = ${NUM_CACHED_SAMPLES}"
 echo "  EVAL_ALL_CHECKPOINTS = ${EVAL_ALL_CHECKPOINTS}"
 echo "  EVAL_CR_SCHEDULE     = ${EVAL_CR_SCHEDULE:-<static>}"
 echo "  TB_DIR            = ${TB_DIR}"
@@ -144,6 +158,7 @@ TRAIN_ARGS=(
   --dataset_name "${DATASET_NAME}"
   --model_name_or_path "${MODEL_NAME}"
   --text_encoder_name "${TEXT_ENCODER_NAME}"
+  --vision_encoder_name "${VISION_ENCODER_NAME}"
   --compression_rate "${COMPRESSION_RATE}"
   --max_samples "${MAX_SAMPLES}"
   --epochs "${EPOCHS}"
@@ -159,9 +174,13 @@ TRAIN_ARGS=(
   --tensorboard_dir "${TB_DIR}/train"
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
   --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
+  --num_pool_latents "${NUM_POOL_LATENTS}"
   --cr_schedule "${CR_SCHEDULE}"
   --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
 )
+if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
+  TRAIN_ARGS+=( --legacy_projector true )
+fi
 if [[ "${ENABLE_WARMUP}" == "1" ]]; then
   TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
 fi
@@ -195,7 +214,9 @@ for MODE in ${EVAL_MODES}; do
     --dataset_split "${EVAL_SPLIT}"
     --model_name_or_path "${MODEL_NAME}"
     --text_encoder_name "${TEXT_ENCODER_NAME}"
+    --vision_encoder_name "${VISION_ENCODER_NAME}"
     --compression_rate "${COMPRESSION_RATE}"
+    --num_pool_latents "${NUM_POOL_LATENTS}"
     --mode "${MODE}"
     --max_samples "${EVAL_MAX_SAMPLES}"
     --batch_size "${EVAL_BATCH_SIZE}"
@@ -207,7 +228,11 @@ for MODE in ${EVAL_MODES}; do
     --tb_run_name "eval_${MODE}"
     --global_step "${STEP}"
     --output_json "${OUTPUT_DIR}/eval_${MODE}.json"
+    --num_cached_samples "${NUM_CACHED_SAMPLES}"
   )
+  if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
+    EVAL_CMD+=( --legacy_projector true )
+  fi
   if [[ "${EVAL_COMPUTE_GEN}" == "1" ]]; then
     EVAL_CMD+=( --compute_generation_metrics )
   fi

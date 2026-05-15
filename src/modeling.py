@@ -1,26 +1,38 @@
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import transformers
+from liger_kernel.transformers.auto_model import MODEL_TYPE_TO_APPLY_LIGER_FN
 from safetensors.torch import load_file
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, ViTModel
 
-# Patch HF's LlamaForCausalLM with fused Triton kernels (RoPE, RMSNorm, SwiGLU,
-# fused-linear-CE). Done at import time so any subsequent
-# AutoModelForCausalLM.from_pretrained(...) for a Llama-family model picks up
-# the patched forward. SmolLM-135M-Instruct is model_type=llama, so all four
-# optimisations apply.
-from liger_kernel.transformers import apply_liger_kernel_to_llama
+# Liger dispatch: pick the apply_liger_kernel_to_<model_type> matching the
+# decoder being loaded. Patches the HF class globally (monkey-patches forward),
+# so it must run BEFORE AutoModelForCausalLM.from_pretrained(...). The
+# fused_linear_cross_entropy fuse is the critical one — it avoids materialising
+# the `[B, L, vocab]` fp32 logits tensor, which on Qwen3 (vocab=151936) is
+# ~3x larger than on Llama/SmolLM2 (vocab=49152) and OOMs at moderate batch.
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer, ViTModel
 
-apply_liger_kernel_to_llama(
-    rope=True,
-    rms_norm=True,
-    swiglu=True,
-    fused_linear_cross_entropy=True,
-    cross_entropy=False,  # mutually exclusive with fused_linear_cross_entropy
-)
+
+def _apply_liger_for(model_name_or_path: str) -> None:
+    if os.environ.get("DISABLE_LIGER", "0").lower() in ("1", "true", "yes"):
+        print("[modeling] DISABLE_LIGER is set; decoder will run without Liger kernels.")
+        return
+    cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    mt = getattr(cfg, "model_type", "")
+    fn = MODEL_TYPE_TO_APPLY_LIGER_FN.get(mt)
+    if fn is None:
+        print(
+            f"[modeling] WARN: no liger patch for model_type={mt!r}; "
+            f"decoder will run unfused — expect ~3-30 GB of fp32 logits "
+            f"depending on (vocab, batch, seq_len)."
+        )
+        return
+    fn(rope=True, rms_norm=True, swiglu=True, fused_linear_cross_entropy=True, cross_entropy=False)
+    print(f"[modeling] applied {fn.__name__} (model_type={mt})")
 
 
 @dataclass
@@ -31,20 +43,36 @@ class ModelArguments:
         default="answerdotai/ModernBERT-base",
         metadata={"help": "HF name of the frozen text encoder that turns source tokens into the vision sequence."},
     )
-    embed_input_dim: int = field(default=768, metadata={"help": "Hidden size of the text encoder output (ModernBERT-base=768)."})
-    max_vision_len: int = field(default=512, metadata={"help": "Max compressed-vision-sequence length; sizes the learned positional embedding."})
-    compression_rate: int = field(default=4, metadata={"help": "Average-pool this many source tokens into one vision token."})
+    embed_input_dim: int = field(
+        default=768, metadata={"help": "Hidden size of the text encoder output (ModernBERT-base=768)."}
+    )
+    max_vision_len: int = field(
+        default=512, metadata={"help": "Max compressed-vision-sequence length; sizes the learned positional embedding."}
+    )
+    compression_rate: int = field(
+        default=4, metadata={"help": "Average-pool this many source tokens into one vision token."}
+    )
     unfreeze_encoder_top_k: int = field(
         default=0,
         metadata={
             "help": "If >0, unfreeze the top-K transformer layers of the text encoder (plus final_norm) and allow gradient flow through them. 0 = legacy fully-frozen behaviour."
         },
     )
-    train: bool = field(
+    num_pool_latents: int = field(
+        default=1,
+        metadata={
+            "help": "Number of learnable latent queries (K) used by the chunked attention pool. K=1 = single-query (legacy). K>1 = Perceiver-style multi-query pool whose K outputs are mean-pooled to produce 1 vision token per chunk."
+        },
+    )
+    projector_use_input_rmsnorm: bool = field(
         default=True,
         metadata={
-            "help": "if true, the model ckpt will be initialized for training; else, it's for inference"
+            "help": "If False, projectors are plain 2-layer MLP (up_proj/GELU/down_proj) — matches pre-RMSNorm checkpoints with no input_norm.* keys."
         },
+    )
+    train: bool = field(
+        default=True,
+        metadata={"help": "if true, the model ckpt will be initialized for training; else, it's for inference"},
     )
 
 
@@ -69,9 +97,7 @@ def print_trainable_parameters(model):
         if param.requires_grad:
             trainable_parameters += param.numel()
     pct = 100 * trainable_parameters / all_param if all_param else 0.0
-    print(
-        f"trainable params: {trainable_parameters} || all params: {all_param} || trainable%: {pct:.4f}"
-    )
+    print(f"trainable params: {trainable_parameters} || all params: {all_param} || trainable%: {pct:.4f}")
 
 
 def freeze_model(model):
@@ -79,14 +105,32 @@ def freeze_model(model):
         param.requires_grad = False
 
 
-class Projector(torch.nn.Module):
-    def __init__(self, input_dim, output_dim):
+class RMSNorm(nn.Module):
+    """RMS normalization over the last dimension (weight-only)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        inv_rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (xf * inv_rms).to(dtype) * self.weight
+
+
+class Projector(torch.nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, use_input_rmsnorm: bool = True):
+        super().__init__()
+        self.input_norm = RMSNorm(input_dim) if use_input_rmsnorm else None
         self.up_proj = torch.nn.Linear(in_features=input_dim, out_features=4 * input_dim)
         self.down_proj = torch.nn.Linear(in_features=4 * input_dim, out_features=output_dim)
         self.gelu = torch.nn.GELU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_norm is not None:
+            x = self.input_norm(x)
         x = self.up_proj(x)
         x = self.gelu(x)
         x = self.down_proj(x)
@@ -98,31 +142,39 @@ def _chunked_attention_pool(
     source_attention_mask: torch.Tensor,
     compression_rate: int,
     max_vision_len: int,
-    pool_query: Optional[torch.Tensor] = None,
+    pool_queries: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool contiguous chunks of `compression_rate` real tokens per sample.
 
-    When ``pool_query`` is None, falls back to plain unweighted mean-pool
-    (legacy behaviour). When ``pool_query`` is provided (shape [H]), each
-    chunk is reduced via softmax-weighted attention:
+    When ``pool_queries`` is None, falls back to plain unweighted mean-pool
+    (legacy behaviour). When ``pool_queries`` is provided, each chunk is
+    reduced via softmax-weighted multi-query attention:
 
-        scores  = (chunk_tokens @ pool_query) / sqrt(H)   # [cr]
-        weights = softmax(scores)                         # [cr]
-        v_i     = sum(weights * chunk_tokens)             # [H]
+        scores  = (chunk_tokens @ Q.T) / sqrt(H)          # [cr, K]
+        weights = softmax(scores, dim=cr)                 # [cr, K]
+        per_q   = einsum("ck,ch->kh", weights, chunk)     # [K, H]
+        v_i     = mean(per_q, dim=K)                       # [H]
+
+    Accepted shapes for ``pool_queries``:
+        [H]      -> single-query pool (K=1), bit-equivalent to legacy attention path.
+        [K, H]   -> Perceiver-style multi-query pool; the K outputs are mean-pooled
+                    to produce one vision token per chunk (output sequence length
+                    unchanged).
 
     The padded tail of the last chunk (when L_real % cr != 0) is masked out
-    with -inf scores so it carries zero softmax weight. With pool_query
-    initialised to zeros, all scores are zero, softmax is uniform over the
-    real tokens of the chunk, and the output is bit-identical to mean-pool —
-    so this is a strict drop-in generalisation that starts at mean-pool and
-    can only improve from there.
+    with -inf scores along the cr axis (broadcast across K) so padded positions
+    carry zero softmax weight regardless of K. With ``pool_queries`` initialised
+    to zeros, all scores are zero, softmax is uniform over real tokens for every
+    K, every per-query output equals the (corrected) mean-pool, and the K-mean
+    is bit-identical to mean-pool. So this remains a strict drop-in
+    generalisation: K=1 zero-init = legacy; K>1 zero-init = legacy.
 
     Args:
         hidden: [B, L, H] encoder output (any dtype).
         source_attention_mask: [B, L] long/int mask (1 for real, 0 for pad).
         compression_rate: pool size.
         max_vision_len: hard cap on output V per sample (truncates longer docs).
-        pool_query: optional [H] learnable parameter; None -> mean-pool.
+        pool_queries: optional [H] or [K, H] learnable parameter; None -> mean-pool.
 
     Returns:
         pooled: [B, V_max, H] where V_max = max V_i across batch.
@@ -144,10 +196,14 @@ def _chunked_attention_pool(
     pooled = torch.zeros((B, V_max, H), dtype=hidden.dtype, device=hidden.device)
     v_mask = torch.zeros((B, V_max), dtype=torch.long, device=hidden.device)
 
-    if pool_query is not None:
+    Q = None
+    scale = 1.0
+    if pool_queries is not None:
         scale = float(H) ** -0.5
-        # Cast pool_query to hidden's dtype for bf16 paths.
-        q = pool_query.to(dtype=hidden.dtype)
+        Q = pool_queries.to(dtype=hidden.dtype)
+        if Q.dim() == 1:
+            Q = Q.unsqueeze(0)  # [H] -> [1, H]; K=1 single-query path.
+        # Q is now [K, H].
 
     for b in range(B):
         L_real = int(lens[b])
@@ -156,26 +212,29 @@ def _chunked_attention_pool(
             continue
         # If the sample would need more than max_vision_len chunks, truncate.
         L_use = min(L_real, V_i * cr)
-        h = hidden[b, :L_use]                       # [L_use, H]
+        h = hidden[b, :L_use]  # [L_use, H]
         pad = V_i * cr - L_use
         if pad > 0:
             h = torch.nn.functional.pad(h, (0, 0, 0, pad))  # zero-pad tail
-        chunked = h.view(V_i, cr, H)                # [V_i, cr, H]
+        chunked = h.view(V_i, cr, H)  # [V_i, cr, H]
 
-        if pool_query is None:
-            chunk_pooled = chunked.mean(dim=1)      # [V_i, H]
+        if Q is None:
+            chunk_pooled = chunked.mean(dim=1)  # [V_i, H]
             if pad > 0:
                 # Last chunk's mean was divided by cr, should be divided by (cr - pad).
                 true_last = cr - pad
                 chunk_pooled[-1] = chunk_pooled[-1] * cr / true_last
         else:
-            scores = (chunked @ q) * scale          # [V_i, cr]
+            # scores[v, c, k] = chunked[v, c] · Q[k] / sqrt(H)
+            scores = torch.einsum("vch,kh->vck", chunked, Q) * scale  # [V_i, cr, K]
             if pad > 0:
-                # Mask padded tail of the LAST chunk only.
+                # Mask padded tail of the LAST chunk along the cr axis (broadcasts over K).
                 neg_inf = torch.finfo(scores.dtype).min
-                scores[-1, cr - pad:] = neg_inf
-            weights = torch.softmax(scores, dim=-1)        # [V_i, cr]
-            chunk_pooled = (weights.unsqueeze(-1) * chunked).sum(dim=1)  # [V_i, H]
+                scores[-1, cr - pad :, :] = neg_inf
+            weights = torch.softmax(scores, dim=1)  # [V_i, cr, K]
+            # Per-query outputs, then mean over K -> single vector per chunk.
+            per_q = torch.einsum("vck,vch->vkh", weights, chunked)  # [V_i, K, H]
+            chunk_pooled = per_q.mean(dim=1)  # [V_i, H]
 
         pooled[b, :V_i] = chunk_pooled
         v_mask[b, :V_i] = 1
@@ -192,26 +251,40 @@ class CVLM(torch.nn.Module):
 
         compute_dtype = torch.bfloat16 if training_args.bf16 else torch.float16
 
+        # Patch decoder class with liger kernels BEFORE instantiating.
+        _apply_liger_for(self.model_name)
+
         # Decoder (frozen LLM)
-        self.decoder = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=compute_dtype)
+        self.decoder = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=compute_dtype,
+            use_safetensors=True,
+        )
 
         # Text encoder (frozen; runs in forward pass instead of offline preprocess).
         self.text_encoder = AutoModel.from_pretrained(
             model_args.text_encoder_name,
             torch_dtype=compute_dtype,
             trust_remote_code=True,
+            use_safetensors=True,
         )
         # Stash the encoder's hidden size for the text_projector input dim.
         enc_hidden = self.text_encoder.config.hidden_size
 
-        self.vision_encoder = ViTModel.from_pretrained(model_args.vision_encoder_name)
+        self.vision_encoder = ViTModel.from_pretrained(
+            model_args.vision_encoder_name,
+            use_safetensors=True,
+        )
+        use_prms = bool(getattr(model_args, "projector_use_input_rmsnorm", True))
         self.text_projector = Projector(
             enc_hidden,
             self.vision_encoder.config.hidden_size,
+            use_input_rmsnorm=use_prms,
         )
         self.vision_projector = Projector(
             self.vision_encoder.config.hidden_size,
             self.decoder.config.hidden_size,
+            use_input_rmsnorm=use_prms,
         )
         # Learned positional embedding for the compressed vision sequence.
         self.max_vision_len = int(model_args.max_vision_len)
@@ -219,13 +292,17 @@ class CVLM(torch.nn.Module):
         self.vision_pos_embed = nn.Embedding(self.max_vision_len, self.vision_encoder.config.hidden_size)
         nn.init.normal_(self.vision_pos_embed.weight, std=0.02)
 
-        # Learnable per-token query for attention pooling over each chunk of
-        # `compression_rate` encoder tokens. Zero-init makes the softmax uniform
-        # over real chunk tokens at step 0, which reduces _chunked_attention_pool
-        # to plain mean-pool — so this is a strict drop-in generalisation.
-        # Old checkpoints lacking this parameter load via strict=False with a
-        # zero-init pool_query and behave identically to legacy mean-pool.
-        self.pool_query = nn.Parameter(torch.zeros(enc_hidden))
+        # Learnable queries for attention pooling over each chunk of
+        # `compression_rate` encoder tokens. Shape [K, H]: K=1 reproduces the
+        # single-query pool; K>1 is a Perceiver-style multi-query pool whose
+        # K outputs are mean-pooled to produce a single vision token per chunk
+        # (so downstream geometry is unchanged for any K).
+        # Zero-init makes the softmax uniform over real chunk tokens at step 0,
+        # which reduces _chunked_attention_pool to plain mean-pool — strict
+        # drop-in generalisation. Old checkpoints lacking this parameter load
+        # via strict=False and behave identically to legacy mean-pool.
+        num_pool_latents = max(int(getattr(model_args, "num_pool_latents", 1) or 1), 1)
+        self.pool_queries = nn.Parameter(torch.zeros(num_pool_latents, enc_hidden))
 
         if training_args.bf16:
             self.text_projector.to(torch.bfloat16)
@@ -267,7 +344,7 @@ class CVLM(torch.nn.Module):
             )
         L = len(layers)
         k_eff = min(k, L)
-        for layer in layers[L - k_eff:]:
+        for layer in layers[L - k_eff :]:
             for p in layer.parameters():
                 p.requires_grad = True
         # Final layer norm sits on top of the stack — unfreeze with the top block
@@ -300,8 +377,9 @@ class CVLM(torch.nn.Module):
         self._freeze_frozen_submodules()
         k_enc = int(getattr(self.model_args, "unfreeze_encoder_top_k", 0) or 0)
         if k_enc <= 0:
-            assert all(not p.requires_grad for p in self.text_encoder.parameters()), \
+            assert all(not p.requires_grad for p in self.text_encoder.parameters()), (
                 "text_encoder must be frozen when unfreeze_encoder_top_k=0"
+            )
         else:
             n_train_enc = sum(p.requires_grad for p in self.text_encoder.parameters())
             n_total_enc = sum(1 for _ in self.text_encoder.parameters())
@@ -357,13 +435,13 @@ class CVLM(torch.nn.Module):
             enc_out = self.text_encoder(
                 input_ids=source_input_ids,
                 attention_mask=source_attention_mask,
-            ).last_hidden_state                     # [B, L, H_enc] in compute_dtype
+            ).last_hidden_state  # [B, L, H_enc] in compute_dtype
         else:
             with torch.no_grad():
                 enc_out = self.text_encoder(
                     input_ids=source_input_ids,
                     attention_mask=source_attention_mask,
-                ).last_hidden_state                 # [B, L, H_enc] in compute_dtype
+                ).last_hidden_state  # [B, L, H_enc] in compute_dtype
             enc_out = enc_out.detach()
 
         pooled, vision_attention_mask = _chunked_attention_pool(
@@ -371,10 +449,10 @@ class CVLM(torch.nn.Module):
             source_attention_mask,
             compression_rate=self.compression_rate,
             max_vision_len=self.max_vision_len,
-            pool_query=self.pool_query,
-        )                                           # [B, V_max, H_enc], [B, V_max]
+            pool_queries=self.pool_queries,
+        )  # [B, V_max, H_enc], [B, V_max]
 
-        vit_input = self.text_projector(pooled)     # [B, V_max, vit_dim]
+        vit_input = self.text_projector(pooled)  # [B, V_max, vit_dim]
         V = vit_input.size(1)
         if V > self.max_vision_len:
             raise ValueError(
@@ -383,9 +461,9 @@ class CVLM(torch.nn.Module):
             )
         pos = torch.arange(V, device=vit_input.device)
         vit_input = vit_input + self.vision_pos_embed(pos).unsqueeze(0).to(vit_input.dtype)
-        vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state   # [B, V, vit_dim]
+        vit_output = self.vision_encoder.encoder(vit_input).last_hidden_state  # [B, V, vit_dim]
         vit_output = self.vision_encoder.layernorm(vit_output)
-        return self.vision_projector(vit_output), vision_attention_mask         # [B, V, llm_dim], [B, V]
+        return self.vision_projector(vit_output), vision_attention_mask  # [B, V, llm_dim], [B, V]
 
     def forward(
         self,
@@ -403,8 +481,8 @@ class CVLM(torch.nn.Module):
         # [B, V, llm_dim], [B, V]
 
         embed_layer = self.decoder.get_input_embeddings()
-        prompt_embs = embed_layer(prompt_ids)   # [B, P, llm_dim]
-        answer_embs = embed_layer(answer_ids)   # [B, A, llm_dim]
+        prompt_embs = embed_layer(prompt_ids)  # [B, P, llm_dim]
+        answer_embs = embed_layer(answer_ids)  # [B, A, llm_dim]
 
         decoder_input = torch.cat([prompt_embs, vision_embeds, answer_embs], dim=1)
 

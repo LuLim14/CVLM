@@ -11,12 +11,13 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from cvlm_dataset import CvlmTrainDataset, make_collate_fn
-from modeling import CVLM, ModelArguments, TrainingArguments
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
+from cvlm_dataset import CvlmTrainDataset, make_collate_fn
+from modeling import CVLM, ModelArguments, TrainingArguments
 from train_utils import (
     AverageMeter,
     cleanup_distributed,
@@ -59,10 +60,7 @@ def _parse_cr_schedule(s: Optional[str]) -> Optional[List[Tuple[int, int]]]:
     if not out:
         return None
     if out[-1][1] != 0:
-        raise ValueError(
-            f"cr_schedule last entry must have end_step=0 (sentinel for +inf); "
-            f"got {out[-1]}"
-        )
+        raise ValueError(f"cr_schedule last entry must have end_step=0 (sentinel for +inf); got {out[-1]}")
     prev_end = 0
     for i, (_, end) in enumerate(out[:-1]):
         if end <= prev_end:
@@ -105,22 +103,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--dataset_name", type=str, default="sggetao/PwC")
     p.add_argument("--dataset_split", type=str, default="train")
-    p.add_argument("--model_name_or_path", type=str, default=None,
-                   help="HF id for the frozen decoder (e.g. HuggingFaceTB/SmolLM-135M-Instruct).")
+    p.add_argument(
+        "--model_name_or_path",
+        type=str,
+        default=None,
+        help="HF id for the frozen decoder (e.g. HuggingFaceTB/SmolLM-135M-Instruct).",
+    )
     p.add_argument("--vision_encoder_name", type=str, default=None)
-    p.add_argument("--text_encoder_name", type=str, default=None,
-                   help="HF id for the frozen text encoder (default: answerdotai/ModernBERT-base).")
-    p.add_argument("--compression_rate", type=int, default=4,
-                   help="Chunk size for mean-pool over encoder tokens into vision tokens.")
+    p.add_argument(
+        "--text_encoder_name",
+        type=str,
+        default=None,
+        help="HF id for the frozen text encoder (default: answerdotai/ModernBERT-base).",
+    )
+    p.add_argument(
+        "--compression_rate",
+        type=int,
+        default=4,
+        help="Chunk size for mean-pool over encoder tokens into vision tokens.",
+    )
     p.add_argument(
         "--unfreeze_encoder_top_k",
         type=int,
         default=int(os.environ.get("UNFREEZE_ENCODER_TOP_K", "0")),
         help="Unfreeze the top-K transformer layers of the text encoder (plus final_norm). "
-             "0 (default) = encoder fully frozen, legacy behaviour.",
+        "0 (default) = encoder fully frozen, legacy behaviour.",
     )
-    p.add_argument("--max_samples", type=int, default=0,
-                   help="Cap HF dataset to first N rows (0 = all).")
+    p.add_argument(
+        "--num_pool_latents",
+        type=int,
+        default=int(os.environ.get("NUM_POOL_LATENTS", "1")),
+        help="Number of learnable latent queries (K) used by the chunked attention pool. "
+        "K=1 (default) = single-query pool. K>1 = Perceiver-style multi-query pool whose "
+        "K outputs are mean-pooled to produce 1 vision token per chunk.",
+    )
+    p.add_argument(
+        "--legacy_projector",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("LEGACY_PROJECTOR", "0") == "1",
+        help="Use projectors without pre-MLP RMSNorm (checkpoint keys: up_proj/down_proj only). "
+        "Set LEGACY_PROJECTOR=1 or pass --legacy_projector true for old safetensors.",
+    )
+    p.add_argument("--max_samples", type=int, default=0, help="Cap HF dataset to first N rows (0 = all).")
     p.add_argument(
         "--max_prompt_len",
         type=int,
@@ -161,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         type=lambda s: str(s).lower() in ("1", "true", "yes"),
         default=os.environ.get("DISABLE_LR_SCHEDULE", "0") == "1",
         help="If set, skip cosine LR decay — keep LR constant at init_lr after warmup. "
-             "Useful for compression-rate curricula where late stages need fresh LR.",
+        "Useful for compression-rate curricula where late stages need fresh LR.",
     )
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument(
@@ -179,7 +203,9 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Directory with model_step_*.safetensors + trainer_step_*.pt; picks latest.",
     )
-    p.add_argument("--restore_from", type=str, default="", help="HF-style; sets TrainingArguments.restore_from for init only.")
+    p.add_argument(
+        "--restore_from", type=str, default="", help="HF-style; sets TrainingArguments.restore_from for init only."
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--no_bf16",
@@ -224,7 +250,7 @@ def parse_args() -> argparse.Namespace:
         type=lambda s: str(s).lower() in ("1", "true", "yes"),
         default=os.environ.get("GRADIENT_CHECKPOINTING", "1") != "0",
         help="Enable activation checkpointing on decoder + ViT (default: on; "
-             "override via env GRADIENT_CHECKPOINTING=0 or --gradient_checkpointing=false).",
+        "override via env GRADIENT_CHECKPOINTING=0 or --gradient_checkpointing=false).",
     )
     p.add_argument(
         "--trackio_project",
@@ -291,6 +317,8 @@ def main() -> None:
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
     model_args.unfreeze_encoder_top_k = int(args.unfreeze_encoder_top_k)
+    model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
 
     training_args = TrainingArguments(output_dir=args.output_dir)
     training_args.bf16 = bool(use_bf16)
@@ -305,11 +333,7 @@ def main() -> None:
     if cr_schedule is not None:
         # Validate vision-len budget for the smallest cr in the schedule.
         min_cr = min(cr for cr, _ in cr_schedule)
-        effective_src = (
-            args.max_source_len
-            if args.max_source_len > 0
-            else args.compression_rate * args.max_vision_len
-        )
+        effective_src = args.max_source_len if args.max_source_len > 0 else args.compression_rate * args.max_vision_len
         required_vl = (effective_src + min_cr - 1) // min_cr
         if args.max_vision_len < required_vl:
             raise ValueError(
@@ -392,16 +416,12 @@ def main() -> None:
     total_steps = max(steps_per_epoch * args.epochs, 1)
 
     if args.enable_warmup:
-        warmup_steps = int(
-            max(args.warmup_ratio * total_steps // 100, args.warmup_steps)
-        )
+        warmup_steps = int(max(args.warmup_ratio * total_steps // 100, args.warmup_steps))
     else:
         warmup_steps = 0
 
     init_lrs: List[float] = [pg["lr"] for pg in optimizer.param_groups]
-    lr_scheduler = CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=args.min_lr
-    )
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.min_lr)
 
     start_epoch = 1
     global_step = 1
@@ -411,20 +431,13 @@ def main() -> None:
             raise FileNotFoundError(resume_from_dir)
         found = find_latest_checkpoint(resume_from_dir)
         if found is None:
-            raise FileNotFoundError(
-                f"No model_step_*.safetensors + trainer_step_*.pt pair in {resume_from_dir}"
-            )
+            raise FileNotFoundError(f"No model_step_*.safetensors + trainer_step_*.pt pair in {resume_from_dir}")
         mp, tp, _ = found
-        start_epoch, global_step = load_cvlm_checkpoint(
-            mp, tp, model, optimizer, lr_scheduler, device
-        )
+        start_epoch, global_step = load_cvlm_checkpoint(mp, tp, model, optimizer, lr_scheduler, device)
         if use_ddp:
             dist.barrier()
         if is_master:
-            print(
-                f"Resumed from {resume_from_dir} "
-                f"next_start_epoch={start_epoch} global_step={global_step}"
-            )
+            print(f"Resumed from {resume_from_dir} next_start_epoch={start_epoch} global_step={global_step}")
 
     if is_master:
         print(optimizer)
@@ -447,6 +460,7 @@ def main() -> None:
     plotter = None
     if is_master:
         from train_logging import TrackioRun, make_logger
+
         run_name = args.trackio_run_name.strip() or os.path.basename(args.output_dir.rstrip("/"))
         config_payload = {
             "model_name_or_path": model_args.model_name_or_path,
@@ -455,6 +469,8 @@ def main() -> None:
             "compression_rate": args.compression_rate,
             "max_vision_len": args.max_vision_len,
             "unfreeze_encoder_top_k": int(args.unfreeze_encoder_top_k),
+            "num_pool_latents": int(model_args.num_pool_latents),
+            "projector_use_input_rmsnorm": bool(model_args.projector_use_input_rmsnorm),
             "max_source_len": args.max_source_len,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
@@ -529,9 +545,7 @@ def main() -> None:
             loss = out["loss"]
             loss = loss / grad_accum_steps
 
-            sync_step = (
-                local_step % grad_accum_steps == 0 or local_step == len(loader)
-            )
+            sync_step = local_step % grad_accum_steps == 0 or local_step == len(loader)
 
             if use_ddp and not sync_step:
                 with model.no_sync():
@@ -542,9 +556,7 @@ def main() -> None:
                 loss.backward()
                 if grad_clip > 0.0:
                     params = unwrap_model(model).parameters()
-                    grad_norm = float(
-                        torch.nn.utils.clip_grad_norm_(params, grad_clip)
-                    )
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(params, grad_clip))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if global_step > warmup_steps and not args.disable_lr_schedule:
@@ -614,12 +626,7 @@ def main() -> None:
             ):
                 plotter.refresh()
 
-            if (
-                is_master
-                and args.save_interval_steps > 0
-                and global_step % args.save_interval_steps == 0
-                and sync_step
-            ):
+            if is_master and args.save_interval_steps > 0 and global_step % args.save_interval_steps == 0 and sync_step:
                 if global_step != pgs:
                     save_cvlm_checkpoint(
                         args.output_dir,
@@ -664,7 +671,7 @@ def main() -> None:
     if is_master:
         print("Training finished.")
         if torch.cuda.is_available():
-            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
             print(f"[train] peak GPU memory: {peak_gb:.2f} GB")
             if trackio_run is not None and trackio_run.enabled:
                 trackio_run.log({"system/peak_gpu_gb": peak_gb}, step=global_step)

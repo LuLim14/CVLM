@@ -32,12 +32,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/
 DATASET_NAME="${DATASET_NAME:-sggetao/PwC}"
 
 # Model
-MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM-135M-Instruct}"
+MODEL_NAME="${MODEL_NAME:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
 TEXT_ENCODER_NAME="${TEXT_ENCODER_NAME:-answerdotai/ModernBERT-base}"
 
 # Train
-EPOCHS="${EPOCHS:-2}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
+EPOCHS="${EPOCHS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 LR="${LR:-1e-5}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_ANSWER_LEN="${MAX_ANSWER_LEN:-1024}"
@@ -49,12 +49,14 @@ PLOT_INTERVAL="${PLOT_INTERVAL:-100}"
 NPROC="${NPROC:-1}"
 ENABLE_WARMUP="${ENABLE_WARMUP:-1}"
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 
 # Eval — these mirror CVLM's eval so the JSONs are diffable.
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-${BATCH_SIZE}}"
 EVAL_COMPUTE_GEN="${EVAL_COMPUTE_GEN:-1}"
+NUM_CACHED_SAMPLES="${NUM_CACHED_SAMPLES:-8}"   # N decoded {doc,q,ref,pred} tuples dumped next to eval JSON; 0 disables
 # These are needed only so CvlmTrainDataset constructs the same filtered set
 # the CVLM eval saw. The SFT decoder doesn't consume vision tokens.
 MAX_VISION_LEN="${MAX_VISION_LEN:-256}"
@@ -95,6 +97,7 @@ echo "  MAX_SAMPLES       = ${MAX_SAMPLES}"
 echo "  PLOT_INTERVAL     = ${PLOT_INTERVAL}"
 echo "  NPROC             = ${NPROC}"
 echo "  EVAL_SPLIT        = ${EVAL_SPLIT}"
+echo "  NUM_CACHED_SAMPLES = ${NUM_CACHED_SAMPLES}"
 echo "  TB_DIR            = ${TB_DIR}"
 echo "  LOG_FILE          = ${LOG_FILE}"
 echo "  TRACKIO_PROJECT   = ${TRACKIO_PROJECT}"
@@ -137,6 +140,9 @@ else
   if [[ "${ENABLE_WARMUP}" == "1" ]]; then
     TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
   fi
+  if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
+    TRAIN_ARGS+=( --gradient_checkpointing )
+  fi
   if [[ "${NPROC}" -gt 1 ]]; then
     torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
   else
@@ -166,6 +172,7 @@ EVAL_CMD=(
   --tensorboard_dir "${TB_DIR}"
   --tb_run_name "eval_sft"
   --output_json "${OUTPUT_DIR}/eval_sft.json"
+  --num_cached_samples "${NUM_CACHED_SAMPLES}"
 )
 if [[ "${EVAL_COMPUTE_GEN}" == "1" ]]; then
   EVAL_CMD+=( --compute_generation_metrics )

@@ -18,11 +18,12 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from cvlm_dataset import CvlmTrainDataset, make_collate_fn
-from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_attention_pool
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from cvlm_dataset import CvlmTrainDataset, make_collate_fn
+from modeling import CVLM, ModelArguments, TrainingArguments, _chunked_attention_pool
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,11 +41,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vision_encoder_name", type=str, default=None)
     p.add_argument("--text_encoder_name", type=str, default=None)
     p.add_argument("--compression_rate", type=int, default=4)
+    p.add_argument(
+        "--num_pool_latents",
+        type=int,
+        default=int(os.environ.get("NUM_POOL_LATENTS", "1")),
+        help="K learnable latent queries for the chunked attention pool. Must match "
+        "the value used at training time so checkpoint pool_queries [K,H] loads.",
+    )
     p.add_argument("--max_prompt_len", type=int, default=512)
     p.add_argument("--max_answer_len", type=int, default=2048)
     p.add_argument("--max_vision_len", type=int, default=512)
-    p.add_argument("--max_source_len", type=int, default=0,
-                   help="0 = compression_rate * max_vision_len")
+    p.add_argument("--max_source_len", type=int, default=0, help="0 = compression_rate * max_vision_len")
     p.add_argument("--max_samples", type=int, default=0, help="Limit eval to first N samples (0 = all).")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -54,34 +61,50 @@ def parse_args() -> argparse.Namespace:
         default="cvlm",
         choices=[
             "cvlm",
-            "cvlm_shuffle",       # sanity: shuffle source tokens before encoder
-            "baseline_llm",        # lower bound: question only, no document
-            "baseline_llm_full",   # upper bound: question + full document text
-            "baseline_proj",       # random linear projection, skips ViT
-            "sft",                 # SFT-trained decoder loaded from --sft_model_path
+            "cvlm_shuffle",  # sanity: shuffle source tokens before encoder
+            "baseline_llm",  # lower bound: question only, no document
+            "baseline_llm_full",  # upper bound: question + full document text
+            "baseline_proj",  # random linear projection, skips ViT
+            "sft",  # SFT-trained decoder loaded from --sft_model_path
         ],
     )
     p.add_argument("--compute_generation_metrics", action="store_true")
+    p.add_argument(
+        "--num_cached_samples",
+        type=int,
+        default=int(os.environ.get("NUM_CACHED_SAMPLES", "8")),
+        help="When --compute_generation_metrics is set, cache the first N "
+        "{document, question, reference, prediction} tuples to a "
+        "*_samples.json file next to the per-ckpt eval JSON. 0 disables.",
+    )
     p.add_argument("--output_json", type=str, default="")
     p.add_argument("--tensorboard_dir", type=str, default="")
     p.add_argument("--tb_run_name", type=str, default="")
-    p.add_argument("--trackio_project", type=str,
-                   default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
-    p.add_argument("--trackio_run_name", type=str,
-                   default=os.environ.get("TRACKIO_RUN_NAME", ""))
-    p.add_argument("--trackio_space_id", type=str,
-                   default=os.environ.get("TRACKIO_SPACE_ID", ""))
-    p.add_argument("--trackio_disable", action="store_true",
-                   default=os.environ.get("TRACKIO_DISABLE", "0") == "1")
-    p.add_argument("--all_checkpoints", action="store_true",
-                   default=os.environ.get("EVAL_ALL_CHECKPOINTS", "0") == "1",
-                   help="Iterate over all model_step_*.safetensors in the checkpoint directory "
-                        "and log each at step=<ckpt_step> in a single trackio run.")
-    p.add_argument("--cr_schedule", type=str,
-                   default=os.environ.get("EVAL_CR_SCHEDULE", ""),
-                   help="When combined with --all_checkpoints: evaluate each checkpoint at the "
-                        "compression_rate that was active when it was trained. Schedule format "
-                        "matches train_cvlm.py: 'cr:end_step,...' with last end_step=0 sentinel.")
+    p.add_argument("--trackio_project", type=str, default=os.environ.get("TRACKIO_PROJECT", "cvlm"))
+    p.add_argument("--trackio_run_name", type=str, default=os.environ.get("TRACKIO_RUN_NAME", ""))
+    p.add_argument("--trackio_space_id", type=str, default=os.environ.get("TRACKIO_SPACE_ID", ""))
+    p.add_argument("--trackio_disable", action="store_true", default=os.environ.get("TRACKIO_DISABLE", "0") == "1")
+    p.add_argument(
+        "--all_checkpoints",
+        action="store_true",
+        default=os.environ.get("EVAL_ALL_CHECKPOINTS", "0") == "1",
+        help="Iterate over all model_step_*.safetensors in the checkpoint directory "
+        "and log each at step=<ckpt_step> in a single trackio run.",
+    )
+    p.add_argument(
+        "--cr_schedule",
+        type=str,
+        default=os.environ.get("EVAL_CR_SCHEDULE", ""),
+        help="When combined with --all_checkpoints: evaluate each checkpoint at the "
+        "compression_rate that was active when it was trained. Schedule format "
+        "matches train_cvlm.py: 'cr:end_step,...' with last end_step=0 sentinel.",
+    )
+    p.add_argument(
+        "--legacy_projector",
+        type=lambda s: str(s).lower() in ("1", "true", "yes"),
+        default=os.environ.get("LEGACY_PROJECTOR", "0") == "1",
+        help="Must match training: omit pre-MLP RMSNorm so old checkpoints load without extra keys.",
+    )
     p.add_argument("--global_step", type=int, default=0)
     p.add_argument("--no_bf16", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -91,6 +114,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _move(batch: dict, device: torch.device) -> dict:
     out = {}
@@ -105,7 +129,7 @@ def _move(batch: dict, device: torch.device) -> dict:
 def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
     """Run the frozen text_encoder + chunked attention pool. Used by baseline_proj.
 
-    Uses the model's trained pool_query so the ablation isolates "ViT vs random
+    Uses the model's trained pool_queries so the ablation isolates "ViT vs random
     linear" rather than mixing in a different pooling rule.
     """
     with torch.no_grad():
@@ -115,7 +139,7 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
         source_mask,
         compression_rate=model.compression_rate,
         max_vision_len=model.max_vision_len,
-        pool_query=model.pool_query,
+        pool_queries=model.pool_queries,
     )
     return pooled, vmask
 
@@ -123,6 +147,7 @@ def _encode_source_for_baseline(model: CVLM, source_ids, source_mask):
 # ---------------------------------------------------------------------------
 # Teacher-forcing metrics
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def eval_teacher_forcing_cvlm(
@@ -198,7 +223,7 @@ def eval_teacher_forcing_cvlm(
         total_loss += per_tok[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P + V - 1:-1, :]
+        answer_logits = logits[:, P + V - 1 : -1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -271,7 +296,7 @@ def eval_teacher_forcing_baseline_llm(
         total_loss += per_token_loss[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P - 1:-1, :]
+        answer_logits = logits[:, P - 1 : -1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -337,9 +362,7 @@ def eval_teacher_forcing_baseline_llm_full(
         total_fp_real += int(prompt_mask.sum().item())
 
         embed_layer = model.decoder.get_input_embeddings()
-        decoder_input = torch.cat(
-            [embed_layer(prompt_ids), embed_layer(answer_ids)], dim=1
-        )
+        decoder_input = torch.cat([embed_layer(prompt_ids), embed_layer(answer_ids)], dim=1)
 
         ignore = torch.full((B, P), -100, dtype=answer_labels.dtype, device=device)
         labels = torch.cat([ignore, answer_labels], dim=1)
@@ -354,7 +377,7 @@ def eval_teacher_forcing_baseline_llm_full(
         total_loss += per_tok[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P - 1:-1, :]
+        answer_logits = logits[:, P - 1 : -1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -423,7 +446,21 @@ def eval_teacher_forcing_sft(
         ignore = torch.full((B, P), -100, dtype=answer_labels.dtype, device=device)
         labels = torch.cat([ignore, answer_labels], dim=1)
 
-        out = decoder(input_ids=input_ids, attention_mask=attn, use_cache=False)
+        # SFT was trained with right-pad (positions [0..N-1] for real tokens),
+        # but the collator left-pads `full_prompt_ids`. Without explicit
+        # position_ids, HF defaults to arange(seq_len) regardless of
+        # attention_mask, which puts real tokens at shifted RoPE phases vs
+        # training. Derive position_ids from the attention mask so real tokens
+        # see the same positions they did during SFT training.
+        position_ids = attn.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attn == 0, 1)
+
+        out = decoder(
+            input_ids=input_ids,
+            attention_mask=attn,
+            position_ids=position_ids,
+            use_cache=False,
+        )
         logits = out.logits
 
         shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
@@ -433,7 +470,7 @@ def eval_teacher_forcing_sft(
         total_loss += per_tok[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P - 1:-1, :]
+        answer_logits = logits[:, P - 1 : -1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -477,9 +514,7 @@ def eval_teacher_forcing_baseline_proj(
     for batch in tqdm(loader, desc="eval (baseline_proj)"):
         batch = _move(batch, device)
         B = batch["prompt_ids"].size(0)
-        pooled, vision_mask = _encode_source_for_baseline(
-            model, batch["source_ids"], batch["source_attention_mask"]
-        )
+        pooled, vision_mask = _encode_source_for_baseline(model, batch["source_ids"], batch["source_attention_mask"])
         vision_embeds = proj(pooled)  # [B, V, llm_dim]
 
         embed_layer = model.decoder.get_input_embeddings()
@@ -508,7 +543,7 @@ def eval_teacher_forcing_baseline_proj(
         total_loss += per_token_loss[mask].sum().item()
         total_tokens += int(mask.sum().item())
 
-        answer_logits = logits[:, P + V - 1:-1, :]
+        answer_logits = logits[:, P + V - 1 : -1, :]
         preds = answer_logits.argmax(dim=-1)
         ans_mask = answer_labels != -100
         total_correct += (preds[ans_mask] == answer_labels[ans_mask]).sum().item()
@@ -533,6 +568,7 @@ def eval_teacher_forcing_baseline_proj(
 # Generation metrics
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def generate_answers(
     model: Optional[CVLM],
@@ -544,7 +580,9 @@ def generate_answers(
     proj: Optional[nn.Linear] = None,
     sft_decoder: Optional[nn.Module] = None,
     sft_tokenizer=None,
-) -> tuple[list[str], list[str]]:
+    num_cached_samples: int = 0,
+    encoder_tokenizer=None,
+) -> tuple[list[str], list[str], list[dict]]:
     if mode == "sft":
         assert sft_decoder is not None and sft_tokenizer is not None
         sft_decoder.eval()
@@ -555,6 +593,7 @@ def generate_answers(
         tokenizer = model.tokenizer
     predictions: list[str] = []
     references: list[str] = []
+    cached_samples: list[dict] = []
     n_samples = 0
 
     for batch in tqdm(loader, desc=f"generate ({mode})"):
@@ -614,7 +653,7 @@ def generate_answers(
                 pad_token_id=tokenizer.pad_token_id,
             )
             # generate() returns the prompt + new tokens; trim the prompt.
-            gen_ids = gen_ids[:, fp_ids.size(1):]
+            gen_ids = gen_ids[:, fp_ids.size(1) :]
         elif mode == "baseline_proj":
             assert proj is not None
             pooled, vision_mask = _encode_source_for_baseline(
@@ -640,23 +679,56 @@ def generate_answers(
 
         answer_ids = batch["answer_ids"]
         answer_labels = batch["answer_labels"]
+        ref_texts: list[str] = []
         for i in range(B):
             m = answer_labels[i] != -100
             ref_ids = answer_ids[i][m]
-            references.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
+            ref_texts.append(tokenizer.decode(ref_ids, skip_special_tokens=True))
+        references.extend(ref_texts)
+
+        # Cache the first N (document, question, reference, prediction) tuples
+        # so eval results are inspectable without re-running generation.
+        if num_cached_samples > 0 and len(cached_samples) < num_cached_samples:
+            # Decode the question using the decoder tokenizer; decode the document
+            # using the encoder tokenizer when available (source_ids live in
+            # encoder vocab), else fall back to decoder tokenizer.
+            prompt_ids = batch["prompt_ids"]
+            prompt_mask = batch["prompt_mask"]
+            doc_ids = batch.get("source_ids", None)
+            doc_mask = batch.get("source_attention_mask", None)
+            doc_tok = encoder_tokenizer if encoder_tokenizer is not None else tokenizer
+            for i in range(B):
+                if len(cached_samples) >= num_cached_samples:
+                    break
+                q_real = prompt_ids[i][prompt_mask[i].bool()]
+                question_text = tokenizer.decode(q_real, skip_special_tokens=True)
+                if doc_ids is not None and doc_mask is not None:
+                    d_real = doc_ids[i][doc_mask[i].bool()]
+                    document_text = doc_tok.decode(d_real, skip_special_tokens=True)
+                else:
+                    document_text = ""
+                cached_samples.append(
+                    {
+                        "index": n_samples + i,
+                        "document": document_text,
+                        "question": question_text,
+                        "reference": ref_texts[i],
+                        "prediction": pred_texts[i],
+                    }
+                )
 
         n_samples += B
         if 0 < max_samples <= n_samples:
             break
 
     if max_samples > 0:
-        return predictions[:max_samples], references[:max_samples]
-    return predictions, references
+        return predictions[:max_samples], references[:max_samples], cached_samples
+    return predictions, references, cached_samples
 
 
 def compute_generation_metrics(predictions: list[str], references: list[str]) -> Dict[str, float]:
-    from rouge_score import rouge_scorer
     import sacrebleu
+    from rouge_score import rouge_scorer
 
     scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
     r1, r2, rl = [], [], []
@@ -680,6 +752,7 @@ def compute_generation_metrics(predictions: list[str], references: list[str]) ->
 # ---------------------------------------------------------------------------
 # Compression metrics
 # ---------------------------------------------------------------------------
+
 
 def compute_compression_stats(
     dataset: CvlmTrainDataset,
@@ -782,6 +855,7 @@ def bits_per_source_token(total_answer_nll_nats: float, total_source_tokens: int
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     args = parse_args()
     if args.mode == "sft" and args.all_checkpoints:
@@ -803,6 +877,7 @@ def main() -> None:
                 f"(cvlm/cvlm_shuffle/baseline_proj); got --mode {args.mode}"
             )
         from train_cvlm import _parse_cr_schedule, _training_cr_for_step
+
         cr_schedule = _parse_cr_schedule(args.cr_schedule)
         print(f"\n=== --cr_schedule active: {cr_schedule} ===")
     torch.manual_seed(args.seed)
@@ -818,6 +893,8 @@ def main() -> None:
         model_args.text_encoder_name = args.text_encoder_name
     model_args.max_vision_len = args.max_vision_len
     model_args.compression_rate = args.compression_rate
+    model_args.num_pool_latents = max(int(args.num_pool_latents), 1)
+    model_args.projector_use_input_rmsnorm = not bool(args.legacy_projector)
 
     training_args = TrainingArguments(output_dir="/tmp/eval_cvlm_dummy")
     training_args.bf16 = bool(use_bf16)
@@ -830,10 +907,11 @@ def main() -> None:
         if not args.sft_model_path:
             raise ValueError("--mode sft requires --sft_model_path <hf_dir>")
         from transformers import AutoModelForCausalLM, AutoTokenizer
+
         print(f"Loading SFT model from {args.sft_model_path}")
         sft_dtype = torch.bfloat16 if use_bf16 else torch.float32
         sft_decoder = AutoModelForCausalLM.from_pretrained(
-            args.sft_model_path, torch_dtype=sft_dtype
+            args.sft_model_path, torch_dtype=sft_dtype, use_safetensors=True
         ).to(device)
         sft_decoder.eval()
         sft_tokenizer = AutoTokenizer.from_pretrained(args.sft_model_path, use_fast=False)
@@ -869,9 +947,8 @@ def main() -> None:
     # Pad ids: in SFT mode there's no CVLM wrapper, so look them up directly.
     if args.mode == "sft":
         from transformers import AutoTokenizer as _AutoTok
-        enc_tok_for_pad = _AutoTok.from_pretrained(
-            model_args.text_encoder_name, use_fast=True, trust_remote_code=True
-        )
+
+        enc_tok_for_pad = _AutoTok.from_pretrained(model_args.text_encoder_name, use_fast=True, trust_remote_code=True)
         if enc_tok_for_pad.pad_token is None:
             enc_tok_for_pad.pad_token = enc_tok_for_pad.eos_token or enc_tok_for_pad.cls_token
         dec_pad = sft_tokenizer.pad_token_id
@@ -923,10 +1000,16 @@ def main() -> None:
             )
             for k in [
                 "source_tokens_mean",
-                "vision_len_mean", "vision_len_median", "vision_len_min", "vision_len_max",
-                "compression_ratio_mean", "compression_ratio_median",
-                "compression_ratio_p10", "compression_ratio_p90",
-                "compression_ratio_min", "compression_ratio_max",
+                "vision_len_mean",
+                "vision_len_median",
+                "vision_len_min",
+                "vision_len_max",
+                "compression_ratio_mean",
+                "compression_ratio_median",
+                "compression_ratio_p10",
+                "compression_ratio_p90",
+                "compression_ratio_min",
+                "compression_ratio_max",
                 "n_compression_samples",
             ]:
                 print(f"  {k:28s}: {stats[k]}")
@@ -943,6 +1026,7 @@ def main() -> None:
     run_name = ""
     if not args.trackio_disable:
         from train_logging import TrackioRun
+
         # Always suffix with _{mode} so each eval mode gets its own trackio
         # run when sharing a base TRACKIO_RUN_NAME across cvlm/baseline_*.
         base_run = args.trackio_run_name.strip() or "eval"
@@ -982,10 +1066,7 @@ def main() -> None:
         )
         if not paths:
             raise ValueError(f"No model_step_*.safetensors found in {ckpt_dir}")
-        ckpt_pairs = [
-            (int(re.search(r"model_step_(\d+)\.safetensors$", p).group(1)), p)
-            for p in paths
-        ]
+        ckpt_pairs = [(int(re.search(r"model_step_(\d+)\.safetensors$", p).group(1)), p) for p in paths]
         print(f"\n=== --all_checkpoints: {len(ckpt_pairs)} checkpoints under {ckpt_dir} ===")
     else:
         ckpt_pairs = [(int(args.global_step), args.checkpoint_path)]
@@ -1018,9 +1099,7 @@ def main() -> None:
             tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples)
         elif args.mode == "cvlm_shuffle":
             assert model is not None
-            tf_metrics = eval_teacher_forcing_cvlm(
-                model, loader, device, args.max_samples, shuffle_source=True
-            )
+            tf_metrics = eval_teacher_forcing_cvlm(model, loader, device, args.max_samples, shuffle_source=True)
         elif args.mode == "baseline_llm":
             assert model is not None
             tf_metrics = eval_teacher_forcing_baseline_llm(model, loader, device, args.max_samples)
@@ -1041,9 +1120,11 @@ def main() -> None:
         print(f"  Token Accuracy:  {tf_metrics['token_accuracy']:.4f}")
         print(f"  Avg Loss:        {tf_metrics['avg_loss']:.4f}")
         print(f"  Samples:         {tf_metrics['n_samples']}")
-        print(f"  Decoder in-len mean/max: "
-              f"{tf_metrics.get('decoder_input_len_mean', 0):.1f} / "
-              f"{tf_metrics.get('decoder_input_len_max', 0)}")
+        print(
+            f"  Decoder in-len mean/max: "
+            f"{tf_metrics.get('decoder_input_len_mean', 0):.1f} / "
+            f"{tf_metrics.get('decoder_input_len_max', 0)}"
+        )
 
         total_nll = float(tf_metrics.get("total_answer_nll_nats", 0.0))
         total_src = int(comp_stats.get("source_tokens_sum", 0))
@@ -1065,13 +1146,18 @@ def main() -> None:
             denom = 0.0
         eff_reduction = comp_stats["source_tokens_mean"] / denom if denom > 0 else 0.0
         print(f"\n  bits_per_source_token       : {bps:.6f}")
-        print(f"  effective_context_reduction : {eff_reduction:.4f}  "
-              f"(source_tokens_mean / context_tokens_used)")
+        print(f"  effective_context_reduction : {eff_reduction:.4f}  (source_tokens_mean / context_tokens_used)")
 
         gen_metrics: Dict[str, float] = {}
+        cached_samples: list[dict] = []
         if args.compute_generation_metrics:
             print(f"\n=== Generation evaluation (mode={args.mode}, step={ckpt_step}) ===")
-            preds, refs = generate_answers(
+            enc_tok_for_cache = None
+            if args.mode == "sft":
+                enc_tok_for_cache = enc_tok_for_pad  # already loaded above for SFT
+            elif model is not None:
+                enc_tok_for_cache = getattr(model, "encoder_tokenizer", None)
+            preds, refs, cached_samples = generate_answers(
                 model,
                 loader,
                 device,
@@ -1081,6 +1167,8 @@ def main() -> None:
                 proj=proj,
                 sft_decoder=sft_decoder,
                 sft_tokenizer=sft_tokenizer,
+                num_cached_samples=max(int(args.num_cached_samples), 0),
+                encoder_tokenizer=enc_tok_for_cache,
             )
             gen_metrics = compute_generation_metrics(preds, refs)
             print(f"  ROUGE-1:       {gen_metrics['rouge1']:.4f}")
@@ -1116,6 +1204,24 @@ def main() -> None:
                 json.dump(results, f, indent=2)
             print(f"  wrote {step_json}")
 
+            if cached_samples:
+                base2, ext2 = os.path.splitext(step_json)
+                samples_path = f"{base2}_samples{ext2}"
+                with open(samples_path, "w") as f:
+                    json.dump(
+                        {
+                            "mode": args.mode,
+                            "step": int(ckpt_step),
+                            "compression_rate": int(eval_cr),
+                            "n_cached": len(cached_samples),
+                            "samples": cached_samples,
+                        },
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                print(f"  wrote {samples_path} ({len(cached_samples)} samples)")
+
         # Log this checkpoint's metrics into the per-mode trackio run.
         if run is not None:
             flat_metrics = {
@@ -1141,16 +1247,19 @@ def main() -> None:
                 row_id = dataset._row_indices[idx]
                 text = dataset._hf[row_id]["input"]
                 s_len = len(dec_tok_hist(text, add_special_tokens=False, truncation=False)["input_ids"])
-                l_enc = min(len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]),
-                            dataset.max_source_len)
+                l_enc = min(
+                    len(enc_tok(text, add_special_tokens=False, truncation=False)["input_ids"]), dataset.max_source_len
+                )
                 v_len = max(min((l_enc + cr - 1) // cr, args.max_vision_len), 1)
                 per_sample_ratios.append(s_len / v_len)
             last_step = int(ckpt_pairs[-1][0])
             if per_sample_ratios:
                 run.log_histogram("eval/compression_ratio_dist", per_sample_ratios, step=last_step)
         run.finish()
-        print(f"\nEval metrics logged to trackio (project={args.trackio_project} "
-              f"run={run_name}, {len(ckpt_pairs)} checkpoint(s))")
+        print(
+            f"\nEval metrics logged to trackio (project={args.trackio_project} "
+            f"run={run_name}, {len(ckpt_pairs)} checkpoint(s))"
+        )
 
     print("\nDone.")
 
