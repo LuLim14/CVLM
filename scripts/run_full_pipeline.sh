@@ -72,8 +72,8 @@ DISABLE_LR_SCHEDULE="${DISABLE_LR_SCHEDULE:-1}"   # 1 = constant LR after warmup
 
 # Output dir — default name embeds main hyperparameters for easy A/B comparison.
 # Override by exporting OUTPUT_DIR=/abs/path before running the script.
-OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_layer_norm_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
-# OUTPUT_DIR=/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260514_004851_qwen3_1.7b_cr1_vl1024_sl0_bs64_lr1e-4_ep10_gc1_unfrzed22_lt4
+# OUTPUT_DIR="${OUTPUT_DIR:-/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_$(date +%Y%m%d_%H%M%S)_layer_norm_cr${COMPRESSION_RATE}_vl${MAX_VISION_LEN}_sl${MAX_SOURCE_LEN}_bs${BATCH_SIZE}_lr${LR}_ep${EPOCHS}_gc${GRADIENT_CHECKPOINTING}_unfrzed${UNFREEZE_ENCODER_TOP_K}_lt${NUM_POOL_LATENTS}}"
+OUTPUT_DIR=/home/jovyan/shares/SR008.fs2/gigachat_checkpoints/rl/ckpts/MoE-losses/cvlm/run_20260515_231650_vit_large_cr1_vl1024_sl0_bs64_lr1e-4_ep10_gc1_unfrzed22_lt4
 
 # Eval
 EVAL_SPLIT="${EVAL_SPLIT:-test}"          # use 'test' once you have one
@@ -139,6 +139,7 @@ echo "  TRACKIO_PROJECT   = ${TRACKIO_PROJECT}"
 echo "  TRACKIO_RUN_NAME  = ${TRACKIO_RUN_NAME}"
 echo "  TRACKIO_SPACE_ID  = ${TRACKIO_SPACE_ID:-<local-only>}"
 echo "  TRACKIO_DISABLE   = ${TRACKIO_DISABLE}"
+echo "  SKIP_TRAIN        = ${SKIP_TRAIN:-0}  (set EVAL_ONLY=1 or SKIP_TRAIN=1 for eval-only)"
 echo "======================================================================"
 echo "trackio UI:   trackio show --project ${TRACKIO_PROJECT}"
 echo "(or set TRACKIO_SPACE_ID=user/space to host on HF Spaces)"
@@ -147,48 +148,57 @@ echo "======================================================================"
 # -----------------------------------------------------------------------------
 # Step 1/2: Train  (skip by exporting SKIP_TRAIN=1 to resume at eval only)
 # -----------------------------------------------------------------------------
+run_train() {
+  echo; echo "===== Step 1/2: Train CVLM -> ${OUTPUT_DIR} ====="
+  local -a TRAIN_ARGS=(
+    "${ROOT}/src/train_cvlm.py"
+    --output_dir "${OUTPUT_DIR}"
+    --dataset_name "${DATASET_NAME}"
+    --model_name_or_path "${MODEL_NAME}"
+    --text_encoder_name "${TEXT_ENCODER_NAME}"
+    --vision_encoder_name "${VISION_ENCODER_NAME}"
+    --compression_rate "${COMPRESSION_RATE}"
+    --max_samples "${MAX_SAMPLES}"
+    --epochs "${EPOCHS}"
+    --batch_size "${BATCH_SIZE}"
+    --lr "${LR}"
+    --max_prompt_len "${MAX_PROMPT_LEN}"
+    --max_answer_len "${MAX_ANSWER_LEN}"
+    --max_vision_len "${MAX_VISION_LEN}"
+    --max_source_len "${MAX_SOURCE_LEN}"
+    --gradient_accumulation_steps "${GRAD_ACCUM}"
+    --log_interval "${LOG_INTERVAL}"
+    --save_interval_steps "${SAVE_INTERVAL_STEPS}"
+    --tensorboard_dir "${TB_DIR}/train"
+    --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
+    --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
+    --num_pool_latents "${NUM_POOL_LATENTS}"
+    --cr_schedule "${CR_SCHEDULE}"
+    --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
+  )
+  if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
+    TRAIN_ARGS+=( --legacy_projector true )
+  fi
+  if [[ "${ENABLE_WARMUP}" == "1" ]]; then
+    TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
+  fi
+  if [[ "${NPROC}" -gt 1 ]]; then
+    torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
+  else
+    python "${TRAIN_ARGS[@]}"
+  fi
+}
+
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
 if [[ "${SKIP_TRAIN}" == "1" ]]; then
-  echo; echo "===== Step 1/2: SKIPPED (SKIP_TRAIN=1) ====="
+  echo; echo "===== Step 1/2: SKIPPED (eval-only) ====="
+elif compgen -G "${OUTPUT_DIR}/model_step_"*.safetensors >/dev/null 2>&1; then
+  echo "ERROR: checkpoints already exist in OUTPUT_DIR=${OUTPUT_DIR}" >&2
+  echo "  Refusing to train into an existing run. Use EVAL_ONLY=1 or SKIP_TRAIN=1 for eval," >&2
+  echo "  or set OUTPUT_DIR to a new directory to train from scratch." >&2
+  exit 1
 else
-echo; echo "===== Step 1/2: Train CVLM -> ${OUTPUT_DIR} ====="
-TRAIN_ARGS=(
-  "${ROOT}/src/train_cvlm.py"
-  --output_dir "${OUTPUT_DIR}"
-  --dataset_name "${DATASET_NAME}"
-  --model_name_or_path "${MODEL_NAME}"
-  --text_encoder_name "${TEXT_ENCODER_NAME}"
-  --vision_encoder_name "${VISION_ENCODER_NAME}"
-  --compression_rate "${COMPRESSION_RATE}"
-  --max_samples "${MAX_SAMPLES}"
-  --epochs "${EPOCHS}"
-  --batch_size "${BATCH_SIZE}"
-  --lr "${LR}"
-  --max_prompt_len "${MAX_PROMPT_LEN}"
-  --max_answer_len "${MAX_ANSWER_LEN}"
-  --max_vision_len "${MAX_VISION_LEN}"
-  --max_source_len "${MAX_SOURCE_LEN}"
-  --gradient_accumulation_steps "${GRAD_ACCUM}"
-  --log_interval "${LOG_INTERVAL}"
-  --save_interval_steps "${SAVE_INTERVAL_STEPS}"
-  --tensorboard_dir "${TB_DIR}/train"
-  --gradient_checkpointing "${GRADIENT_CHECKPOINTING}"
-  --unfreeze_encoder_top_k "${UNFREEZE_ENCODER_TOP_K}"
-  --num_pool_latents "${NUM_POOL_LATENTS}"
-  --cr_schedule "${CR_SCHEDULE}"
-  --disable_lr_schedule "${DISABLE_LR_SCHEDULE}"
-)
-if [[ "${LEGACY_PROJECTOR}" == "1" ]]; then
-  TRAIN_ARGS+=( --legacy_projector true )
-fi
-if [[ "${ENABLE_WARMUP}" == "1" ]]; then
-  TRAIN_ARGS+=( --enable_warmup --warmup_steps "${WARMUP_STEPS}" )
-fi
-if [[ "${NPROC}" -gt 1 ]]; then
-  torchrun --nproc_per_node="${NPROC}" "${TRAIN_ARGS[@]}"
-else
-  python "${TRAIN_ARGS[@]}"
-fi
+  run_train
 fi
 
 # -----------------------------------------------------------------------------
